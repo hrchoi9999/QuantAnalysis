@@ -113,8 +113,8 @@
 - 쓰는 DB/테이블:
   - 없음
 - 수정/생성하는 파일:
-  - `D:\QunatBackup\QuantAnalysis-yyyyMMdd-HHmmss`
-  - `D:\QunatBackup\QuantAnalysis-yyyyMMdd-HHmmss\backup_manifest.json`
+  - `D:\QuantBackup\QuantAnalysis\QuantAnalysis-yyyyMMdd-HHmmss`
+  - `D:\QuantBackup\QuantAnalysis\QuantAnalysis-yyyyMMdd-HHmmss\backup_manifest.json`
 - 외부 API/네트워크 의존성:
   - 없음
 - 정상 완료 판단 기준:
@@ -129,7 +129,7 @@
 - 실패 시 사용자에게 알려야 하는 조건:
   - 백업 실패
   - 2일 연속 백업 실패
-  - `D:\QunatBackup` 쓰기 권한 오류
+  - `D:\QuantBackup\QuantAnalysis` 쓰기 권한 오류
 - 평균 실행 시간:
   - 현재 기준 수 초 내외
   - `outputs` 증가에 따라 늘어날 수 있음
@@ -172,7 +172,7 @@
 - 산출물 이름: QuantAnalysis 일일 로컬 백업
 - 산출물 형식: 폴더 + JSON manifest
 - 산출물 현재 위치:
-  - `D:\QunatBackup\QuantAnalysis-yyyyMMdd-HHmmss`
+  - `D:\QuantBackup\QuantAnalysis\QuantAnalysis-yyyyMMdd-HHmmss`
 - 허브에 공유해야 할 위치:
   - `D:\QuantOpsScheduler\state\run-status\quantanalysis-local-backup-latest.json`
 - 최신 상태 판정 기준:
@@ -223,7 +223,7 @@
   - 2회 연속 API/network 실패
   - 후보 종목 수 불일치
   - 백업 실패
-  - `D:\QunatBackup` 쓰기 권한 오류
+  - `D:\QuantBackup\QuantAnalysis` 쓰기 권한 오류
 
 ## 6. 요청하는 통합 자동실행 결과
 
@@ -272,7 +272,7 @@
   - `status = ok`
   - `snapshot_rows = 10`
 - 마지막 확인된 로컬 백업:
-  - `D:\QunatBackup\QuantAnalysis-20260523-105551`
+  - 현재 표준 백업 경로: `D:\QuantBackup\QuantAnalysis`
 
 ## 8. 명시적으로 자동실행에서 제외할 작업
 
@@ -284,7 +284,7 @@
 ## 9. QuantOpsScheduler에 요청
 
 1. 이 문서를 기준으로 QuantAnalysis 자동실행 작업을 통합 레지스트리에 등록해 주세요.
-2. Scheduler는 자체 공유 저장소와 `D:\QunatBackup`에만 write해 주세요.
+2. Scheduler는 자체 공유 저장소와 `D:\QuantBackup\QuantAnalysis`에만 write해 주세요.
 3. `D:\QuantAnalysis` 내부 DB/파일을 직접 수정하지 말아 주세요.
 4. 통합 자동실행이 완성되면 QuantAnalysis 쓰레드에 완료 고지를 보내 주세요.
 5. 완료 고지를 받은 뒤 QuantAnalysis 쪽 기존 Codex 자동실행 `quantanalysis`는 최종 중지/삭제하겠습니다.

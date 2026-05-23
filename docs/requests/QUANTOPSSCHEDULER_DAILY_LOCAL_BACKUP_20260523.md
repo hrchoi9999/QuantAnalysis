@@ -12,7 +12,7 @@ powershell -ExecutionPolicy Bypass -File D:\QuantAnalysis\backup_quantanalysis_l
 
 ## 백업 위치
 
-- 기본 위치: `D:\QunatBackup`
+- 기본 위치: `D:\QuantBackup\QuantAnalysis`
 - 백업 폴더명: `QuantAnalysis-yyyyMMdd-HHmmss`
 - manifest: 각 백업 폴더의 `backup_manifest.json`
 
