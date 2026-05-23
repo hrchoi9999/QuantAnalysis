@@ -1,5 +1,5 @@
 param(
-    [string]$BackupRoot = "D:\QuantAnalysis\backups",
+    [string]$BackupRoot = "D:\QunatBackup",
     [int]$KeepDays = 30
 )
 
