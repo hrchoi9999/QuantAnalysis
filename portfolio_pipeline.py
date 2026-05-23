@@ -20,6 +20,7 @@ DOCS_DIR = ROOT / "docs"
 PORTFOLIO_DOCS_DIR = DOCS_DIR / "portfolio"
 DB_PATH = ROOT / "analysis.db"
 PRICE_DB_PATH = Path(r"D:\Quant\data\db\price.db")
+AI_FEATURE_DB_PATH = Path(r"D:\Quant\data\db\ai_feature_ext.db")
 MARKET_STATUS = Path(r"D:\QuantMarket\reports\market_analysis\market_ai_generation_status_latest.json")
 MARKET_CONTEXT = Path(r"D:\QuantMarket\reports\market_analysis\market_context_latest.json")
 ETF_ALLOC_DIR = Path(r"D:\Quant\reports\backtest_etf_allocation")
@@ -36,6 +37,7 @@ KIWOOM_QUOTE_API_ID = "ka10001"
 KIWOOM_INVESTOR_API_ID = "ka10059"
 KIWOOM_APPKEY_FILE = Path(r"D:\Quant\config\kiwoom_54810245_appkey.txt")
 KIWOOM_SECRETKEY_FILE = Path(r"D:\Quant\config\kiwoom_54810245_secretkey.txt")
+NAVER_INVESTOR_URL = "https://finance.naver.com/item/frgn.naver"
 
 
 TARGET_STOCKS = {
@@ -361,6 +363,271 @@ def load_price_db_quotes(stocks, asof_date):
     return out
 
 
+def normalize_ticker(value):
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits.zfill(6) if digits else None
+
+
+def pick_column(columns, candidates):
+    normalized = {str(col).replace(" ", ""): str(col) for col in columns}
+    for candidate in candidates:
+        key = candidate.replace(" ", "")
+        if key in normalized:
+            return normalized[key]
+    for col in columns:
+        compact = str(col).replace(" ", "")
+        if any(candidate.replace(" ", "") in compact for candidate in candidates):
+            return str(col)
+    return None
+
+
+def pick_column_with_all_tokens(columns, tokens):
+    for col in columns:
+        compact = str(col).replace(" ", "")
+        if all(token in compact for token in tokens):
+            return str(col)
+    return None
+
+
+def won_to_eok(value):
+    number = parse_kiwoom_number(value)
+    return None if number is None else round(float(number) / 100_000_000, 1)
+
+
+def load_local_investor_flows(stocks, asof_date):
+    if not AI_FEATURE_DB_PATH.exists():
+        return {}
+    tickers = [stock["ticker"] for stock in stocks]
+    placeholders = ",".join("?" for _ in tickers)
+    investor_map = {
+        "외국인": "foreign_net_억원",
+        "기관합계": "institution_net_억원",
+        "개인": "individual_net_억원",
+        "연기금": "pension_net_억원",
+    }
+    query = f"""
+        SELECT ticker, investor, net_value, source
+        FROM investor_flows_daily
+        WHERE date = ?
+          AND ticker IN ({placeholders})
+          AND investor IN ('외국인', '기관합계', '개인', '연기금')
+    """
+    out = {}
+    try:
+        with sqlite3.connect(AI_FEATURE_DB_PATH) as con:
+            rows = con.execute(query, [asof_date, *tickers]).fetchall()
+    except sqlite3.Error:
+        return {}
+    for ticker, investor, net_value, source in rows:
+        field = investor_map.get(investor)
+        if not field:
+            continue
+        row = out.setdefault(ticker, {"flow_date": asof_date, "flow_source": source or "ai_feature_ext.investor_flows_daily"})
+        row[field] = won_to_eok(net_value)
+    return out
+
+
+def load_krx_investor_flows(stocks, asof_date):
+    tickers = {stock["ticker"] for stock in stocks}
+    investor_map = {
+        "외국인": "foreign_net_억원",
+        "기관합계": "institution_net_억원",
+        "개인": "individual_net_억원",
+        "연기금": "pension_net_억원",
+    }
+    try:
+        from pykrx import stock as krx_stock
+    except Exception:
+        return {}
+
+    out = {}
+    api_date = normalize_api_date(asof_date)
+    for investor, field in investor_map.items():
+        for market in ("KOSPI", "KOSDAQ"):
+            try:
+                raw = krx_stock.get_market_net_purchases_of_equities_by_ticker(
+                    api_date,
+                    api_date,
+                    market=market,
+                    investor=investor,
+                )
+            except Exception:
+                continue
+            if raw is None or raw.empty:
+                continue
+            frame = raw.reset_index()
+            ticker_col = pick_column(list(frame.columns), ["티커", "종목코드", "ticker", "index"])
+            net_value_col = pick_column(list(frame.columns), ["순매수거래대금", "순매수대금", "순매수금액"])
+            if not ticker_col or not net_value_col:
+                continue
+            for row in frame.to_dict(orient="records"):
+                ticker = normalize_ticker(row.get(ticker_col))
+                if ticker not in tickers:
+                    continue
+                item = out.setdefault(
+                    ticker,
+                    {"flow_date": asof_date, "flow_source": "pykrx_krx_investor_net_purchase"},
+                )
+                item[field] = won_to_eok(row.get(net_value_col))
+    return out
+
+
+def load_naver_investor_flow_for_ticker(ticker, asof_date, session):
+    try:
+        import pandas as pd
+    except Exception:
+        return {}
+    try:
+        response = session.get(
+            NAVER_INVESTOR_URL,
+            params={"code": ticker, "page": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        tables = pd.read_html(response.content, encoding="euc-kr", flavor="lxml")
+    except Exception:
+        return {}
+
+    flow_table = None
+    for table in tables:
+        df = table.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join(str(x) for x in col if str(x) != "nan").strip("_") for col in df.columns]
+        else:
+            df.columns = [str(col) for col in df.columns]
+        compact_cols = "".join(df.columns)
+        if "날짜" in compact_cols and "기관" in compact_cols and "외국인" in compact_cols:
+            flow_table = df
+            break
+    if flow_table is None:
+        return {}
+
+    date_col = pick_column(list(flow_table.columns), ["날짜"])
+    close_col = pick_column(list(flow_table.columns), ["종가"])
+    inst_col = pick_column_with_all_tokens(list(flow_table.columns), ["기관", "순매매량"])
+    foreign_col = pick_column_with_all_tokens(list(flow_table.columns), ["외국인", "순매매량"])
+    if not date_col or not close_col or not inst_col or not foreign_col:
+        return {}
+    for row in flow_table.to_dict(orient="records"):
+        date_text = str(row.get(date_col) or "").strip()
+        try:
+            trade_date = datetime.strptime(date_text, "%Y.%m.%d").strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+        if trade_date != asof_date:
+            continue
+        close = parse_kiwoom_number(row.get(close_col))
+        foreign_volume = parse_kiwoom_number(row.get(foreign_col))
+        inst_volume = parse_kiwoom_number(row.get(inst_col))
+        return {
+            "foreign_net_억원": won_to_eok(None if close is None or foreign_volume is None else close * foreign_volume),
+            "institution_net_억원": won_to_eok(None if close is None or inst_volume is None else close * inst_volume),
+            "flow_date": asof_date,
+            "flow_source": "naver_finance_frgn_derived_value",
+            "naver_close": abs(close) if close is not None else None,
+        }
+    return {}
+
+
+def load_naver_investor_flows(stocks, asof_date):
+    out = {}
+    with requests.Session() as session:
+        for stock in stocks:
+            flow = load_naver_investor_flow_for_ticker(stock["ticker"], asof_date, session)
+            if flow:
+                out[stock["ticker"]] = flow
+            time.sleep(0.15)
+    return out
+
+
+def merge_flow_sources(*sources):
+    out = {}
+    for source in sources:
+        for ticker, flow in source.items():
+            current = out.setdefault(ticker, {})
+            for key, value in flow.items():
+                if current.get(key) is None and value is not None:
+                    current[key] = value
+    return out
+
+
+def load_backup_investor_flows(stocks, asof_date):
+    local = load_local_investor_flows(stocks, asof_date)
+    missing = [stock for stock in stocks if stock["ticker"] not in local]
+    krx = load_krx_investor_flows(missing, asof_date) if missing else {}
+    missing = [stock for stock in stocks if stock["ticker"] not in local and stock["ticker"] not in krx]
+    naver = load_naver_investor_flows(missing, asof_date) if missing else {}
+    return merge_flow_sources(local, krx, naver)
+
+
+def attach_backup_live_snapshot(stocks, asof_date, reason, errors=None, historical_quotes=None):
+    fetched_at = datetime.now(KST).isoformat(timespec="milliseconds")
+    historical_quotes = historical_quotes if historical_quotes is not None else load_price_db_quotes(stocks, asof_date)
+    backup_flows = load_backup_investor_flows(stocks, asof_date)
+    merged = []
+    complete_count = 0
+    attached_count = 0
+    sources = set()
+    for stock in stocks:
+        item = dict(stock)
+        ticker = stock["ticker"]
+        quote = historical_quotes.get(ticker, {})
+        flow = backup_flows.get(ticker, {})
+        naver_close = flow.get("naver_close")
+        price = quote.get("price")
+        if price is None and naver_close is not None:
+            price = naver_close
+        if quote or flow:
+            price_source = quote.get("price_source") or ("naver_finance_frgn_close" if naver_close is not None else None)
+            flow_source = flow.get("flow_source")
+            quote_sources = [source for source in (price_source, flow_source) if source]
+            source_text = "+".join(dict.fromkeys(quote_sources)) if quote_sources else "backup_snapshot"
+            sources.add(source_text)
+            live_quote = {
+                "price": price,
+                "change_pct": quote.get("change_pct"),
+                "foreign_net_억원": flow.get("foreign_net_억원"),
+                "institution_net_억원": flow.get("institution_net_억원"),
+                "individual_net_억원": flow.get("individual_net_억원"),
+                "pension_net_억원": flow.get("pension_net_억원"),
+                "source": source_text,
+                "asof_date": asof_date,
+                "fetched_at": fetched_at,
+                "price_date": quote.get("price_date") or asof_date,
+                "flow_date": flow.get("flow_date"),
+            }
+            item["live_quote"] = live_quote
+            attached_count += 1
+            if (
+                live_quote.get("price") is not None
+                and live_quote.get("foreign_net_억원") is not None
+                and live_quote.get("institution_net_억원") is not None
+            ):
+                complete_count += 1
+        else:
+            item["live_quote"] = None
+        merged.append(item)
+
+    if complete_count == len(stocks):
+        status = "ok"
+    elif attached_count:
+        status = "partial"
+    else:
+        status = "not_loaded"
+    return {
+        "status": status,
+        "source": "+".join(sorted(sources)) if sources else None,
+        "asof_date": asof_date,
+        "fetched_at": fetched_at,
+        "reason": reason,
+        "success_count": complete_count,
+        "error_count": 0 if not errors else len(errors),
+        "errors": (errors or [])[:10],
+        "items": merged,
+    }
+
+
 def request_kiwoom_investor_amount(token, ticker, asof_date):
     payload = kiwoom_post(
         token,
@@ -418,7 +685,7 @@ def infer_market_risk(market_status):
 def attach_live_snapshot(stocks, asof_date):
     if os.getenv("QUANTANALYSIS_DISABLE_KIWOOM_LIVE") != "1":
         return attach_kiwoom_live_snapshot(stocks, asof_date)
-    return attach_static_snapshot(stocks, asof_date, "disabled")
+    return attach_backup_live_snapshot(stocks, asof_date, "kiwoom_disabled")
 
 
 def attach_kiwoom_live_snapshot(stocks, asof_date):
@@ -427,10 +694,13 @@ def attach_kiwoom_live_snapshot(stocks, asof_date):
     try:
         token, expires_dt = kiwoom_access_token()
     except Exception as exc:
-        fallback = attach_static_snapshot(stocks, asof_date, "token_failed")
-        fallback["fetched_at"] = fetched_at
-        fallback["errors"] = [str(exc)]
-        return fallback
+        return attach_backup_live_snapshot(
+            stocks,
+            asof_date,
+            "kiwoom_token_failed",
+            [str(exc)],
+            historical_quotes=historical_quotes,
+        )
 
     merged = []
     errors = []
@@ -460,26 +730,69 @@ def attach_kiwoom_live_snapshot(stocks, asof_date):
         merged.append(item)
         time.sleep(0.2)
 
-    if success_count == len(stocks):
+    if success_count < len(stocks):
+        backup = attach_backup_live_snapshot(
+            stocks,
+            asof_date,
+            "kiwoom_partial_failed",
+            errors,
+            historical_quotes=historical_quotes,
+        )
+        backup_by_ticker = {
+            item.get("ticker"): item.get("live_quote")
+            for item in backup.get("items", [])
+            if item.get("live_quote")
+        }
+        for item in merged:
+            if item.get("live_quote") is None and backup_by_ticker.get(item.get("ticker")):
+                item["live_quote"] = backup_by_ticker[item["ticker"]]
+
+    complete_count = sum(
+        1
+        for item in merged
+        if item.get("live_quote")
+        and item["live_quote"].get("price") is not None
+        and item["live_quote"].get("foreign_net_억원") is not None
+        and item["live_quote"].get("institution_net_억원") is not None
+    )
+    attached_count = sum(1 for item in merged if item.get("live_quote"))
+
+    if complete_count == len(stocks):
         status = "ok"
-    elif success_count:
+    elif attached_count:
         status = "partial"
     else:
-        fallback = attach_static_snapshot(stocks, asof_date, "request_failed")
-        fallback["fetched_at"] = fetched_at
+        fallback = attach_backup_live_snapshot(
+            stocks,
+            asof_date,
+            "kiwoom_request_failed",
+            errors,
+            historical_quotes=historical_quotes,
+        )
         fallback["token_expires_dt"] = expires_dt
-        fallback["errors"] = errors[:10]
         return fallback
+
+    sources = sorted(
+        {
+            item["live_quote"].get("source")
+            for item in merged
+            if item.get("live_quote") and item["live_quote"].get("source")
+        }
+    )
 
     return {
         "status": status,
-        "source": "price.db.prices_daily+kiwoom_rest_ka10059"
-        if historical_quotes
-        else f"kiwoom_rest_{KIWOOM_QUOTE_API_ID}+{KIWOOM_INVESTOR_API_ID}",
+        "source": "+".join(sources)
+        if sources
+        else (
+            "price.db.prices_daily+kiwoom_rest_ka10059"
+            if historical_quotes
+            else f"kiwoom_rest_{KIWOOM_QUOTE_API_ID}+{KIWOOM_INVESTOR_API_ID}"
+        ),
         "asof_date": asof_date,
         "fetched_at": fetched_at,
         "token_expires_dt": expires_dt,
-        "success_count": success_count,
+        "success_count": complete_count,
         "error_count": len(errors),
         "errors": errors[:10],
         "items": merged,
