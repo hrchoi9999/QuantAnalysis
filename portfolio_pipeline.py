@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -38,6 +39,12 @@ KIWOOM_INVESTOR_API_ID = "ka10059"
 KIWOOM_APPKEY_FILE = Path(r"D:\Quant\config\kiwoom_54810245_appkey.txt")
 KIWOOM_SECRETKEY_FILE = Path(r"D:\Quant\config\kiwoom_54810245_secretkey.txt")
 NAVER_INVESTOR_URL = "https://finance.naver.com/item/frgn.naver"
+GCS_BUCKET = "quantservice-489808-market-analysis"
+GCS_CURRENT_TARGET = f"gs://{GCS_BUCKET}/admin/current/investment_portfolio_latest.json"
+GCS_HISTORY_PREFIX = f"gs://{GCS_BUCKET}/admin/history"
+GCS_PUBLIC_CURRENT_URL = (
+    f"https://storage.googleapis.com/{GCS_BUCKET}/admin/current/investment_portfolio_latest.json"
+)
 
 
 TARGET_STOCKS = {
@@ -2013,9 +2020,88 @@ def fmt(value):
     return str(value)
 
 
+def resolve_gcloud():
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        bundled = Path(local_appdata) / "GoogleCloudSDK" / "google-cloud-sdk" / "bin" / "gcloud.cmd"
+        try:
+            if bundled.exists():
+                return bundled
+        except OSError:
+            pass
+    found = shutil.which("gcloud")
+    if found:
+        return Path(found)
+    raise RuntimeError("gcloud not found")
+
+
+def validate_portfolio_json(path):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid portfolio json: {path}") from exc
+    required = ["as_of_date", "generated_at", "source_thread"]
+    missing = [key for key in required if not payload.get(key)]
+    candidates = payload.get("stock_strategy", {}).get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        missing.append("stock_strategy.candidates")
+    if missing:
+        raise RuntimeError(f"portfolio json missing required fields: {', '.join(missing)}")
+    return payload
+
+
+def run_gcloud(gcloud, *args):
+    completed = subprocess.run(
+        [str(gcloud), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"gcloud {' '.join(args)} failed: {stderr}")
+
+
+def publish_portfolio_to_gcs(latest_json_path, archive_json_path):
+    payload = validate_portfolio_json(latest_json_path)
+    gcloud = resolve_gcloud()
+    run_gcloud(gcloud, "config", "configurations", "activate", "quantservice")
+    run_gcloud(gcloud, "storage", "cp", str(latest_json_path), GCS_CURRENT_TARGET, "--quiet")
+    run_gcloud(
+        gcloud,
+        "storage",
+        "cp",
+        str(archive_json_path),
+        f"{GCS_HISTORY_PREFIX}/{archive_json_path.name}",
+        "--quiet",
+    )
+
+    verify_url = f"{GCS_PUBLIC_CURRENT_URL}?ts={int(time.time())}"
+    response = requests.get(
+        verify_url,
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    remote_payload = response.json()
+    if remote_payload.get("generated_at") != payload.get("generated_at"):
+        raise RuntimeError(
+            "GCS publish verification failed: "
+            f"local generated_at={payload.get('generated_at')}, "
+            f"remote generated_at={remote_payload.get('generated_at')}"
+        )
+    return {
+        "target": GCS_CURRENT_TARGET,
+        "history": f"{GCS_HISTORY_PREFIX}/{archive_json_path.name}",
+        "generated_at": payload.get("generated_at"),
+        "verify_url": verify_url,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--asof", default=datetime.now(KST).strftime("%Y-%m-%d"))
+    parser.add_argument("--skip-gcs-publish", action="store_true")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2029,12 +2115,20 @@ def main():
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     write_markdown(report, md_path)
     run_id = save_report_to_db(report, json_path, md_path)
-    shutil.copyfile(json_path, OUTPUT_DIR / "investment_portfolio_latest.json")
+    latest_json_path = OUTPUT_DIR / "investment_portfolio_latest.json"
+    shutil.copyfile(json_path, latest_json_path)
     shutil.copyfile(md_path, PORTFOLIO_DOCS_DIR / "investment_portfolio_latest.md")
+    publish_result = None
+    if not args.skip_gcs_publish and os.getenv("QUANTANALYSIS_SKIP_GCS_PUBLISH") != "1":
+        publish_result = publish_portfolio_to_gcs(latest_json_path, json_path)
     print(str(json_path))
     print(str(md_path))
     print(f"db={DB_PATH}")
     print(f"run_id={run_id}")
+    if publish_result:
+        print(f"gcs_current={publish_result['target']}")
+        print(f"gcs_history={publish_result['history']}")
+        print(f"gcs_generated_at={publish_result['generated_at']}")
 
 
 if __name__ == "__main__":
