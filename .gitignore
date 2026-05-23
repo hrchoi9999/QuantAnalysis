@@ -4,6 +4,7 @@
 *.sqlite3
 outputs/
 _tmp/
+backups/
 
 # Python/runtime caches
 __pycache__/

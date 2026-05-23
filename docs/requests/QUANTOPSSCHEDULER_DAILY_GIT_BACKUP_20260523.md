@@ -1,8 +1,16 @@
-# QuantOpsScheduler 작업요청서: QuantAnalysis 일일 git 백업
+# QuantOpsScheduler 작업요청서: QuantAnalysis 일일 git 백업 - 폐기
 
 ## 목적
 
-`D:\QuantAnalysis`의 코드, 문서, 요청서 변경사항을 매일 1회 GitHub 저장소로 백업한다.
+이 요청서는 사용하지 않는다.
+
+사용자 요청의 "백업" 의미는 git push가 아니라 로컬 파일 백업이다.
+
+대체 요청서:
+
+- `D:\QuantAnalysis\docs\requests\QUANTOPSSCHEDULER_DAILY_LOCAL_BACKUP_20260523.md`
+
+아래 내용은 폐기된 이전 초안이다.
 
 ## 대상 저장소
 
