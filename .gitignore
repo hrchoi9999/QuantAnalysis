@@ -1,0 +1,20 @@
+# Runtime databases and generated outputs
+*.db
+*.sqlite
+*.sqlite3
+outputs/
+_tmp/
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local logs and temp files
+*.log
+*.tmp
+
+# Local environment files
+.env
+.venv/
+venv/
