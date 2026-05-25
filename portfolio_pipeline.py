@@ -22,6 +22,7 @@ PORTFOLIO_DOCS_DIR = DOCS_DIR / "portfolio"
 DB_PATH = ROOT / "analysis.db"
 PRICE_DB_PATH = Path(r"D:\Quant\data\db\price.db")
 AI_FEATURE_DB_PATH = Path(r"D:\Quant\data\db\ai_feature_ext.db")
+MARKET_ANALYSIS_DB_PATH = Path(r"D:\QuantMarket\data\db\market_analysis.db")
 MARKET_STATUS = Path(r"D:\QuantMarket\reports\market_analysis\market_ai_generation_status_latest.json")
 MARKET_CONTEXT = Path(r"D:\QuantMarket\reports\market_analysis\market_context_latest.json")
 ETF_ALLOC_DIR = Path(r"D:\Quant\reports\backtest_etf_allocation")
@@ -45,6 +46,24 @@ GCS_HISTORY_PREFIX = f"gs://{GCS_BUCKET}/admin/history"
 GCS_PUBLIC_CURRENT_URL = (
     f"https://storage.googleapis.com/{GCS_BUCKET}/admin/current/investment_portfolio_latest.json"
 )
+
+STEP1_V2_LOGIC_VERSION = "step1_v2_6grade_20260525"
+STEP1_GRADE_LABELS = {
+    1: "강한 위험회피",
+    2: "위험회피",
+    3: "주의 관찰",
+    4: "중립",
+    5: "우호적 관찰",
+    6: "적극 위험선호",
+}
+STEP1_GRADE_BOUNDS = [
+    (1, 0, 24),
+    (2, 25, 39),
+    (3, 40, 54),
+    (4, 55, 69),
+    (5, 70, 84),
+    (6, 85, 100),
+]
 
 
 TARGET_STOCKS = {
@@ -675,11 +694,379 @@ def classify_market_rating(total_score, risk_score):
     return "Cautious Watch"
 
 
+def market_db_uri():
+    return f"file:{MARKET_ANALYSIS_DB_PATH.as_posix()}?mode=ro&immutable=1"
+
+
+def connect_market_db():
+    if not MARKET_ANALYSIS_DB_PATH.exists():
+        return None
+    con = sqlite3.connect(market_db_uri(), uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def latest_market_date_with_flow(con, asof_date):
+    row = con.execute(
+        """
+        SELECT MAX(session_date) AS session_date
+        FROM market_intraday_flow_signal
+        WHERE session_date <= ?
+        """,
+        (asof_date,),
+    ).fetchone()
+    return row["session_date"] if row and row["session_date"] else asof_date
+
+
+def latest_row_by_date(con, table, date_col, target_date):
+    row = con.execute(
+        f"""
+        SELECT *
+        FROM {table}
+        WHERE {date_col} = ?
+        ORDER BY asof DESC
+        LIMIT 1
+        """,
+        (target_date,),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def latest_rows_by_date(con, table, date_col, target_date):
+    rows = con.execute(
+        f"""
+        SELECT *
+        FROM {table}
+        WHERE {date_col} = ?
+          AND asof = (
+              SELECT MAX(asof)
+              FROM {table}
+              WHERE {date_col} = ?
+          )
+        ORDER BY asof DESC
+        """,
+        (target_date, target_date),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_market_v2_inputs(asof_date):
+    try:
+        con = connect_market_db()
+    except Exception:
+        return {}
+    if con is None:
+        return {}
+    with con:
+        effective_date = latest_market_date_with_flow(con, asof_date)
+        latest_asof_row = con.execute(
+            """
+            SELECT MAX(asof) AS asof
+            FROM market_intraday_state
+            WHERE session_date = ?
+            """,
+            (effective_date,),
+        ).fetchone()
+        return {
+            "requested_asof_date": asof_date,
+            "effective_date": effective_date,
+            "effective_asof": latest_asof_row["asof"] if latest_asof_row else None,
+            "features": latest_row_by_date(con, "market_features_hourly", "asof_date", effective_date),
+            "component": latest_row_by_date(con, "market_component_scores", "date(asof)", effective_date),
+            "state": latest_row_by_date(con, "market_intraday_state", "session_date", effective_date),
+            "breadth": latest_rows_by_date(con, "market_intraday_breadth", "session_date", effective_date),
+            "index": latest_rows_by_date(con, "market_intraday_index_snapshot", "session_date", effective_date),
+            "futures": latest_row_by_date(con, "market_intraday_futures_snapshot", "session_date", effective_date),
+            "fx": latest_row_by_date(con, "market_intraday_fx_snapshot", "session_date", effective_date),
+            "flows": latest_rows_by_date(con, "market_intraday_flow_signal", "session_date", effective_date),
+        }
+
+
+def pct(value):
+    return None if value is None else value * 100
+
+
+def index_by_name(rows):
+    return {row.get("index_name"): row for row in rows}
+
+
+def flow_by_code(rows):
+    return {row.get("signal_code"): row for row in rows}
+
+
+def clamp_score(value, maximum):
+    return max(0, min(maximum, round(value, 1)))
+
+
+def score_direction_axis(inputs):
+    state = inputs.get("state", {})
+    indexes = index_by_name(inputs.get("index", []))
+    features = inputs.get("features", {})
+    futures = inputs.get("futures", {})
+    score = 0
+    reasons = []
+    direction_score = state.get("direction_score")
+    if isinstance(direction_score, (int, float)):
+        score += min(12, max(0, direction_score / 3 * 12))
+    kospi = pct((indexes.get("KOSPI") or {}).get("change_pct"))
+    kosdaq = pct((indexes.get("KOSDAQ") or {}).get("change_pct"))
+    if kospi is not None and kospi > 0:
+        score += 2
+    if kosdaq is not None and kosdaq > 0:
+        score += 2
+    if features.get("kospi_20d_ret", 0) > 0 and features.get("kospi200_20d_ret", 0) > 0:
+        score += 1.5
+    if futures.get("change_pct") is not None and futures.get("change_pct") >= 0:
+        score += 0.5
+    reasons.append(f"KOSPI {fmt(kospi)}%, KOSDAQ {fmt(kosdaq)}%")
+    reasons.append(f"KOSPI 20일 {fmt(pct(features.get('kospi_20d_ret')))}%, KOSDAQ 20일 {fmt(pct(features.get('kosdaq_20d_ret')))}%")
+    reasons.append(f"선물 {fmt(pct(futures.get('change_pct')))}%")
+    return clamp_score(score, 20), reasons
+
+
+def score_breadth_axis(inputs):
+    features = inputs.get("features", {})
+    breadth_rows = inputs.get("breadth", [])
+    score = 0
+    reasons = []
+    positive_ratios = [
+        row.get("positive_ratio")
+        for row in breadth_rows
+        if isinstance(row.get("positive_ratio"), (int, float))
+    ]
+    avg_positive = sum(positive_ratios) / len(positive_ratios) if positive_ratios else None
+    if avg_positive is not None:
+        if avg_positive >= 0.75:
+            score += 8
+        elif avg_positive >= 0.6:
+            score += 6
+        elif avg_positive >= 0.5:
+            score += 4
+        else:
+            score += 2
+    adv_dec = features.get("adv_dec_ratio")
+    if isinstance(adv_dec, (int, float)):
+        if adv_dec >= 5:
+            score += 4
+        elif adv_dec >= 2:
+            score += 3
+        elif adv_dec >= 1:
+            score += 2
+    above20 = features.get("above_20dma_ratio")
+    above60 = features.get("above_60dma_ratio")
+    if isinstance(above20, (int, float)):
+        score += 4 if above20 >= 0.55 else 2 if above20 >= 0.4 else 0
+    if isinstance(above60, (int, float)):
+        score += 3 if above60 >= 0.55 else 1 if above60 >= 0.4 else 0
+    if features.get("new_high_count", 0) > features.get("new_low_count", 0):
+        score += 1
+    reasons.append(f"상승종목 평균비율 {fmt(pct(avg_positive))}%")
+    reasons.append(f"20일선 위 {fmt(pct(above20))}%, 60일선 위 {fmt(pct(above60))}%")
+    reasons.append(f"신고가 {fmt(features.get('new_high_count'))}, 신저가 {fmt(features.get('new_low_count'))}")
+    return clamp_score(score, 20), reasons
+
+
+def score_flow_axis(inputs):
+    flows = flow_by_code(inputs.get("flows", []))
+    score = 10
+    reasons = []
+    foreign = (flows.get("FOREIGNER_NET") or {}).get("metric_value")
+    institution = (flows.get("INSTITUTION_NET") or {}).get("metric_value")
+    program = (flows.get("PROGRAM_TOTAL_NET") or {}).get("metric_value")
+    if isinstance(foreign, (int, float)):
+        score += 3 if foreign > 3000 else 1 if foreign > 0 else -4 if foreign < -10000 else -2
+    if isinstance(institution, (int, float)):
+        score += 3 if institution > 3000 else 1 if institution > 0 else -2 if institution < -3000 else 0
+    if isinstance(program, (int, float)):
+        score += 3 if program > 3000 else 1 if program > 0 else -4 if program < -10000 else -2
+    if not flows:
+        score -= 4
+        reasons.append("외국인/기관/프로그램 수급 없음")
+    else:
+        reasons.append(f"외국인 {fmt(foreign)}억원, 기관 {fmt(institution)}억원")
+        reasons.append(f"프로그램 전체 {fmt(program)}억원")
+    reasons.append("선물 수급은 가격 방향만 참고하고 투자주체별 수급은 추가 데이터가 필요함")
+    return clamp_score(score, 20), reasons
+
+
+def score_risk_axis(inputs, market_context):
+    features = inputs.get("features", {})
+    fx = inputs.get("fx", {})
+    score = 14
+    reasons = []
+    fx_day = pct(fx.get("change_pct"))
+    fx_20d = pct(features.get("usdkrw_20d_ret"))
+    ktb3y = features.get("rate_ktb3y_20d_chg")
+    vol = pct(features.get("realized_vol_20d"))
+    if fx_day is not None and fx_day > 0.5:
+        score -= 2
+    if fx_20d is not None and fx_20d > 1:
+        score -= 2
+    if ktb3y is not None and ktb3y > 0.2:
+        score -= 2
+    if vol is not None and vol > 3:
+        score -= 1
+    if market_context.get("caution_bias"):
+        score -= 1
+    reasons.append(f"원달러 당일 {fmt(fx_day)}%, 20일 {fmt(fx_20d)}%")
+    reasons.append(f"국고3년 20일 변화 {fmt(ktb3y)}%p, 20일 변동성 {fmt(vol)}%")
+    if market_context.get("risk_headlines"):
+        reasons.append("글로벌 이벤트/유가/금리 뉴스 경계 신호 존재")
+    return clamp_score(score, 20), reasons
+
+
+def score_style_axis(inputs):
+    indexes = index_by_name(inputs.get("index", []))
+    features = inputs.get("features", {})
+    kospi = pct((indexes.get("KOSPI") or {}).get("change_pct"))
+    kosdaq = pct((indexes.get("KOSDAQ") or {}).get("change_pct"))
+    kospi200 = pct((indexes.get("KOSPI200") or {}).get("change_pct"))
+    score = 5
+    reasons = []
+    if kosdaq is not None and kospi is not None and kosdaq > kospi:
+        score += 2
+    if kospi200 is not None and kospi is not None and kospi >= kospi200:
+        score += 1
+    if features.get("regime_3m_score") is not None:
+        score += 1
+    if features.get("kosdaq_60d_ret", 0) > 0 and features.get("kospi_60d_ret", 0) > 0:
+        score += 1
+    reasons.append(f"KOSDAQ {fmt(kosdaq)}% vs KOSPI {fmt(kospi)}%")
+    reasons.append("중소형/성장 위험선호가 회복됐지만 수급 확인이 필요함")
+    return clamp_score(score, 10), reasons
+
+
+def score_data_quality_axis(inputs, asof_date):
+    effective_date = inputs.get("effective_date")
+    rows = []
+    rows.extend(inputs.get("breadth", []))
+    rows.extend(inputs.get("index", []))
+    if inputs.get("futures"):
+        rows.append(inputs["futures"])
+    if inputs.get("fx"):
+        rows.append(inputs["fx"])
+    fallback_count = sum(1 for row in rows if row.get("is_fallback"))
+    has_flow = bool(inputs.get("flows"))
+    score = 10
+    reasons = []
+    if fallback_count:
+        score -= min(3, fallback_count)
+    if not has_flow:
+        score -= 3
+    if effective_date != asof_date and has_flow:
+        reasons.append(f"{asof_date} 휴장/비거래일로 판단해 마지막 거래일 {effective_date} 기준으로 평가")
+    if fallback_count:
+        reasons.append(f"fallback 데이터 {fallback_count}건")
+    if has_flow:
+        reasons.append("마지막 거래일 외국인/기관/프로그램 수급 데이터 확인")
+    else:
+        reasons.append("수급 데이터 미확인")
+    return clamp_score(score, 10), reasons
+
+
+def step1_grade_from_score(score):
+    for grade, low, high in STEP1_GRADE_BOUNDS:
+        if low <= score <= high:
+            return grade
+    return 6 if score > 100 else 1
+
+
+def step1_boundary_info(score, grade):
+    for current, low, high in STEP1_GRADE_BOUNDS:
+        if current != grade:
+            continue
+        if grade < 6 and high - score <= 3:
+            return True, grade + 1, "상단 경계"
+        if grade > 1 and score - low <= 3:
+            return True, grade - 1, "하단 경계"
+    return False, None, "중앙"
+
+
+def display_step1_grade(grade, boundary_position=None):
+    label = STEP1_GRADE_LABELS.get(grade, "미분류")
+    if boundary_position in {"상단 경계", "하단 경계"}:
+        suffix = "상단" if boundary_position == "상단 경계" else "하단"
+        return f"{grade}등급 {label} {suffix}"
+    return f"{grade}등급 {label}"
+
+
+def build_step1_v2_assessment(market_risk, asof_date, market_context):
+    inputs = load_market_v2_inputs(asof_date)
+    if not inputs:
+        return {}
+    axes = []
+    direction, direction_reasons = score_direction_axis(inputs)
+    breadth, breadth_reasons = score_breadth_axis(inputs)
+    flow, flow_reasons = score_flow_axis(inputs)
+    risk, risk_reasons = score_risk_axis(inputs, market_context)
+    style, style_reasons = score_style_axis(inputs)
+    quality, quality_reasons = score_data_quality_axis(inputs, asof_date)
+    axes.extend(
+        [
+            {"axis": "시장 방향성", "score": direction, "max_score": 20, "reasons": direction_reasons},
+            {"axis": "시장 확산력", "score": breadth, "max_score": 20, "reasons": breadth_reasons},
+            {"axis": "수급", "score": flow, "max_score": 20, "reasons": flow_reasons},
+            {"axis": "변동성/리스크", "score": risk, "max_score": 20, "reasons": risk_reasons},
+            {"axis": "시장 스타일", "score": style, "max_score": 10, "reasons": style_reasons},
+            {"axis": "데이터 신뢰도", "score": quality, "max_score": 10, "reasons": quality_reasons},
+        ]
+    )
+    total = clamp_score(sum(row["score"] for row in axes), 100)
+    grade = step1_grade_from_score(total)
+    is_boundary, adjacent_grade, boundary_position = step1_boundary_info(total, grade)
+    conflict_boundary = (
+        grade == 4
+        and direction >= 16
+        and breadth >= 14
+        and (flow <= 8 or risk <= 8)
+    )
+    if conflict_boundary:
+        is_boundary = True
+        adjacent_grade = 5
+        boundary_position = "상단 경계"
+    return {
+        "logic_version": STEP1_V2_LOGIC_VERSION,
+        "requested_asof_date": asof_date,
+        "effective_date": inputs.get("effective_date"),
+        "effective_asof": inputs.get("effective_asof"),
+        "legacy_rating": market_risk.get("rating"),
+        "legacy_total_score": market_risk.get("total_score"),
+        "legacy_risk_score": market_risk.get("risk_score"),
+        "score": total,
+        "grade": grade,
+        "label": STEP1_GRADE_LABELS.get(grade),
+        "display_rating": display_step1_grade(grade, boundary_position),
+        "is_boundary": is_boundary,
+        "adjacent_grade": adjacent_grade,
+        "adjacent_label": STEP1_GRADE_LABELS.get(adjacent_grade),
+        "boundary_position": boundary_position,
+        "boundary_reason": (
+            "방향성과 확산력은 5등급에 가깝지만 수급 또는 리스크가 약해 4등급 상단으로 분류"
+            if conflict_boundary
+            else None
+        ),
+        "axes": axes,
+    }
+
+
+def apply_step1_v2_assessment(market_risk, asof_date, market_context):
+    updated = dict(market_risk)
+    assessment = build_step1_v2_assessment(updated, asof_date, market_context)
+    if not assessment:
+        return updated
+    updated["legacy_rating"] = updated.get("rating")
+    updated["rating"] = assessment["display_rating"]
+    updated["step1_v2"] = assessment
+    updated["asof"] = assessment.get("effective_asof") or updated.get("asof")
+    updated["action"] = build_market_action(updated)
+    return updated
+
+
 def refresh_market_risk_rating(market_risk):
     refreshed = dict(market_risk)
     rating = classify_market_rating(refreshed.get("total_score"), refreshed.get("risk_score"))
     refreshed["rating"] = rating
-    refreshed["action"] = build_market_action(rating)
+    refreshed["action"] = build_market_action(refreshed)
     return refreshed
 
 
@@ -702,19 +1089,60 @@ def infer_market_risk(market_status):
         "summary": state.get("summary_line"),
         "breadth": breadth,
         "flows": flows,
-        "action": build_market_action(rating),
+        "action": build_market_action({"rating": rating}),
     }
 
 
+def market_grade(market_risk):
+    step1 = market_risk.get("step1_v2") or {}
+    grade = step1.get("grade")
+    return grade if isinstance(grade, int) else None
+
+
+def market_rating_text(market_risk):
+    step1 = market_risk.get("step1_v2") or {}
+    return step1.get("display_rating") or market_risk.get("rating")
+
+
 def is_defensive_caution(market_risk):
+    grade = market_grade(market_risk)
+    if grade is not None:
+        return grade <= 2
     return market_risk.get("rating") in {"Defensive Caution", "Cautious Watch"}
 
 
 def is_constructive_watch(market_risk):
+    grade = market_grade(market_risk)
+    if grade is not None:
+        return grade >= 5
     return market_risk.get("rating") == "Constructive Watch"
 
 
-def build_market_action(rating):
+def is_neutral_grade(market_risk):
+    grade = market_grade(market_risk)
+    if grade is not None:
+        return grade == 4
+    return market_risk.get("rating") == "Neutral Watch"
+
+
+def is_cautious_grade(market_risk):
+    grade = market_grade(market_risk)
+    if grade is not None:
+        return grade == 3
+    return market_risk.get("rating") == "Cautious Watch"
+
+
+def build_market_action(market_risk):
+    grade = market_grade(market_risk)
+    if grade == 6:
+        return "시장 위험선호가 매우 강하다. 다만 종목별 수급과 과열 여부를 확인해 주식 비중을 확대한다."
+    if grade == 5:
+        return "시장 흐름은 강세 우위다. 주식 후보는 추격매수보다 수급 확인 후 단계적 편입을 검토한다."
+    if grade == 4:
+        return "중립 관찰 구간이다. 주식은 선별 관찰과 소액 분할만 검토한다."
+    if grade == 3:
+        return "약한 경계 구간이다. ETF/현금성 자산을 우선하고 주식 신규 편입은 제한한다."
+    rating = market_risk.get("rating") if isinstance(market_risk, dict) else str(market_risk)
     if rating == "Constructive Watch":
         return "시장 흐름은 강세 우위다. 주식 후보는 추격매수보다 수급 확인 후 단계적 편입을 검토한다."
     if rating == "Neutral Watch":
@@ -725,9 +1153,12 @@ def build_market_action(rating):
 
 
 def build_etf_strategy_reason(market_risk):
-    if market_risk.get("rating") == "Defensive Caution":
+    grade = market_grade(market_risk)
+    if grade is not None and (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "STEP1이 등급 경계 구간이므로 S6 방어 배분을 기본안으로 두고, 수급 개선 시 조건부 주식 편입안을 함께 제시한다."
+    if grade is not None and grade <= 2:
         return "시장 위험 신호가 높아 위험자산 노출을 낮추는 S6 방어형 ETF 모델을 우선 적용한다."
-    if market_risk.get("rating") == "Cautious Watch":
+    if grade is not None and grade == 3:
         return "시장은 완전한 위험 회피 구간은 아니지만 경계 신호가 있어 S6 방어 배분을 유지한다."
     if is_constructive_watch(market_risk):
         return "시장 강도는 우호적이나 수급 확인과 이벤트 리스크가 남아 있어 S6 방어 배분을 기본축으로 유지하고 주식 편입은 단계적으로 검토한다."
@@ -738,9 +1169,13 @@ def build_etf_strategy_reason(market_risk):
 
 
 def build_market_step_summary(market_risk):
-    if market_risk.get("rating") == "Defensive Caution":
+    step1 = market_risk.get("step1_v2") or {}
+    if step1.get("is_boundary"):
+        return f"시장판단은 {market_rating_text(market_risk)}이다. 등급 경계 구간이므로 보수안과 조건부 공격안을 함께 검토한다."
+    grade = market_grade(market_risk)
+    if grade is not None and grade <= 2:
         return "시장 위험 신호가 높아 방어적 판단을 우선했다."
-    if market_risk.get("rating") == "Cautious Watch":
+    if grade is not None and grade == 3:
         return "일부 지표가 약해진 경계 구간으로 판단했다. 공격적 비중 확대보다 방어적 확인이 필요하다."
     if is_constructive_watch(market_risk):
         return "시장 방향과 종목 확산은 강세다. 다만 수급 데이터 공백과 이벤트 리스크가 있어 강세 관찰 구간으로 판단했다."
@@ -748,9 +1183,15 @@ def build_market_step_summary(market_risk):
 
 
 def build_market_step_conclusion(market_risk):
-    if market_risk.get("rating") == "Defensive Caution":
+    step1 = market_risk.get("step1_v2") or {}
+    if step1.get("is_boundary"):
+        adjacent = step1.get("adjacent_grade")
+        adjacent_label = STEP1_GRADE_LABELS.get(adjacent)
+        return f"기본은 {market_rating_text(market_risk)} 기준 보수안이며, 수급 개선 시 {adjacent}등급 {adjacent_label} 기준 조건부 포트폴리오로 전환한다."
+    grade = market_grade(market_risk)
+    if grade is not None and grade <= 2:
         return "오늘은 공격적 주식 매수보다 방어형 자산과 현금성 자산을 우선한다."
-    if market_risk.get("rating") == "Cautious Watch":
+    if grade is not None and grade == 3:
         return "오늘은 주식 신규 편입을 제한하고 방어 배분을 유지한다."
     if is_constructive_watch(market_risk):
         return "오늘은 주식 비중 확대를 검토할 수 있지만, 추격매수보다 수급 확인 후 단계적으로 접근한다."
@@ -758,9 +1199,13 @@ def build_market_step_conclusion(market_risk):
 
 
 def build_etf_step_summary(market_risk):
-    if market_risk.get("rating") == "Defensive Caution":
+    step1 = market_risk.get("step1_v2") or {}
+    if step1.get("is_boundary"):
+        return "STEP1이 경계 구간이므로 S6 중심 보수안과 주식 일부 편입 조건부안을 동시에 제시했다."
+    grade = market_grade(market_risk)
+    if grade is not None and grade <= 2:
         return "시장 위험이 높은 구간이므로 위험자산 편입을 줄이고 방어형 ETF 모델인 S6를 우선 적용했다."
-    if market_risk.get("rating") == "Cautious Watch":
+    if grade is not None and grade == 3:
         return "경계 구간이므로 S6 ETF 배분을 방어축으로 유지했다."
     if is_constructive_watch(market_risk):
         return "시장 강도는 우호적이지만 이벤트 리스크와 수급 확인 필요성이 남아 있어 S6 ETF 배분을 기본축으로 유지했다."
@@ -768,9 +1213,13 @@ def build_etf_step_summary(market_risk):
 
 
 def build_etf_step_conclusion(market_risk):
-    if market_risk.get("rating") == "Defensive Caution":
+    step1 = market_risk.get("step1_v2") or {}
+    if step1.get("is_boundary"):
+        return "S6를 기본축으로 유지하되 수급 개선 여부에 따라 주식 편입안을 병행 검토한다."
+    grade = market_grade(market_risk)
+    if grade is not None and grade <= 2:
         return "포트폴리오의 중심은 S6 방어 배분으로 두는 것이 합리적이다."
-    if market_risk.get("rating") == "Cautious Watch":
+    if grade is not None and grade == 3:
         return "S6는 경계 구간에서 변동성을 낮추는 기준 배분으로 해석한다."
     if is_constructive_watch(market_risk):
         return "S6는 강세를 부정하는 신호가 아니라, 주식 편입을 단계적으로 늘리기 전 유지하는 기준 배분이다."
@@ -778,49 +1227,157 @@ def build_etf_step_conclusion(market_risk):
 
 
 def build_final_step_summary(market_risk):
+    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "시장 방향성과 확산력은 우호적이나 수급과 리스크가 엇갈려 보수안과 조건부 공격안을 함께 제시하는 것이 결론이다."
     if is_constructive_watch(market_risk):
         return "시장 강도는 우호적이지만 ETF 모델, 주식 후보, 수급 확인을 종합하면 단계적 주식 편입과 S6 기준 배분 병행이 결론이다."
-    if market_risk.get("rating") == "Neutral Watch":
+    if is_neutral_grade(market_risk):
         return "시장 위험, ETF 모델, 주식 후보, 수급 확인을 종합하면 오늘은 S6 기준 배분을 유지하며 주식은 제한적으로 검토하는 결론이다."
     return "시장 위험, ETF 모델, 주식 후보, 수급 확인을 종합하면 오늘은 방어형 ETF 중심 포트폴리오가 결론이다."
 
 
 def build_final_step_conclusion(market_risk):
+    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "최종 결론은 보수안을 기본 포트폴리오로 채택하고, 외국인/프로그램 수급 개선 시 조건부 공격안으로 전환하는 것이다."
     if is_constructive_watch(market_risk):
         return "최종 결론은 S6 기준 배분을 유지하되, 주식은 수급 개선 종목부터 단계적 편입을 검토하는 것이다."
-    if market_risk.get("rating") == "Neutral Watch":
+    if is_neutral_grade(market_risk):
         return "최종 결론은 S6 기준 배분 유지, 주식은 관찰/소액 분할 검토이다."
     return "최종 결론은 ETF 방어 배분 우선, 주식은 관찰/소액 분할 검토이다."
 
 
 def build_step6_first_detail(market_risk):
+    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "ETF는 S6 기준 배분을 기본안으로 두고, 주식은 조건부 편입안으로 별도 관리한다."
     if is_constructive_watch(market_risk):
         return "ETF는 S6 기준 배분을 유지하되, 주식 편입 가능성을 함께 검토한다."
     return "ETF는 S6 방어 배분을 중심으로 한다."
 
 
 def build_stock_exposure_guidance(market_risk):
+    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "기본안은 주식 10~20% 이내 제한, 조건부안은 수급 개선 확인 시 20~35%까지 단계적 편입 검토."
     if is_constructive_watch(market_risk):
         return "오늘 주식 비중은 0% 고정이 아니라 수급이 확인되는 종목부터 단계적 편입을 검토."
-    if market_risk.get("rating") == "Neutral Watch":
+    if is_neutral_grade(market_risk):
         return "오늘 주식 비중은 0% 고정이 아니라 최대 10~20% 이내 관찰/소액 분할 검토."
     return "오늘 주식 신규 편입은 제한하고 방어 배분을 우선."
 
 
 def build_final_process_result(market_risk):
+    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "보수안 기본 + 조건부 공격안 병행"
     if is_constructive_watch(market_risk):
         return "S6 기준 배분 유지 + 주식 단계적 편입 검토"
-    if market_risk.get("rating") == "Neutral Watch":
+    if is_neutral_grade(market_risk):
         return "S6 기준 배분 유지, 주식은 제한 비중"
     return "ETF 방어 배분 중심, 주식은 제한 비중"
 
 
 def build_stock_candidate_step_conclusion(market_risk):
+    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
+        return "주식 후보는 유지하되 기본안에서는 제한 비중, 조건부안에서는 수급 개선 종목부터 단계적 편입한다."
     if is_constructive_watch(market_risk):
         return "주식 후보는 유지하고, 수급과 가격 조건이 개선되는 종목부터 단계적 편입을 검토한다."
-    if market_risk.get("rating") == "Neutral Watch":
+    if is_neutral_grade(market_risk):
         return "주식 후보는 유지하되 오늘 전체 주식 비중은 최대 10~20% 이내로 제한한다."
     return "주식 후보는 유지하되 신규 편입은 제한하고 관찰 중심으로 관리한다."
+
+
+def build_step2_portfolio_scenarios(market_risk):
+    step1 = market_risk.get("step1_v2") or {}
+    grade = step1.get("grade") or market_grade(market_risk)
+    scenarios = []
+    if step1.get("is_boundary") and grade == 4 and step1.get("adjacent_grade") == 5:
+        scenarios.append(
+            {
+                "scenario": "A",
+                "name": "보수안",
+                "basis": "4등급 중립 상단",
+                "etf_policy": "S6_DEFENSIVE_V1 중심 유지",
+                "stock_policy": "주식 후보는 관찰/소액분할 중심",
+                "stock_weight_range_pct": "10~20",
+                "cash_or_defensive_weight": "높게 유지",
+                "activation_condition": "기본 적용",
+            }
+        )
+        scenarios.append(
+            {
+                "scenario": "B",
+                "name": "조건부 공격안",
+                "basis": "5등급 우호적 관찰 하단",
+                "etf_policy": "S6 유지 + 성장/모멘텀 노출 일부 허용",
+                "stock_policy": "수급 개선 종목부터 단계적 편입",
+                "stock_weight_range_pct": "20~35",
+                "cash_or_defensive_weight": "일부 축소",
+                "activation_condition": "외국인/프로그램 매도 완화 또는 기관·외국인 동시 개선 확인",
+            }
+        )
+        return scenarios
+    if grade and grade <= 2:
+        return [
+            {
+                "scenario": "A",
+                "name": "방어안",
+                "basis": f"{grade}등급 {STEP1_GRADE_LABELS.get(grade)}",
+                "etf_policy": "S6_DEFENSIVE_V1 방어 배분 우선",
+                "stock_policy": "신규 주식 편입 제한",
+                "stock_weight_range_pct": "0~10",
+                "cash_or_defensive_weight": "최대화",
+                "activation_condition": "기본 적용",
+            }
+        ]
+    if grade == 3:
+        return [
+            {
+                "scenario": "A",
+                "name": "주의 관찰안",
+                "basis": "3등급 주의 관찰",
+                "etf_policy": "S6_DEFENSIVE_V1 중심",
+                "stock_policy": "관찰 중심, 소액 편입만 예외 허용",
+                "stock_weight_range_pct": "0~15",
+                "cash_or_defensive_weight": "높게 유지",
+                "activation_condition": "기본 적용",
+            }
+        ]
+    if grade == 5:
+        return [
+            {
+                "scenario": "A",
+                "name": "우호적 관찰안",
+                "basis": "5등급 우호적 관찰",
+                "etf_policy": "S6 기준 배분 유지",
+                "stock_policy": "수급과 가격 안정 종목부터 단계적 편입",
+                "stock_weight_range_pct": "20~40",
+                "cash_or_defensive_weight": "중립 이하로 축소",
+                "activation_condition": "기본 적용",
+            }
+        ]
+    if grade == 6:
+        return [
+            {
+                "scenario": "A",
+                "name": "적극 위험선호안",
+                "basis": "6등급 적극 위험선호",
+                "etf_policy": "방어 ETF 비중 축소",
+                "stock_policy": "주식 전략 모델 비중 확대",
+                "stock_weight_range_pct": "35~60",
+                "cash_or_defensive_weight": "낮게 유지",
+                "activation_condition": "과열/수급 훼손이 없을 때 적용",
+            }
+        ]
+    return [
+        {
+            "scenario": "A",
+            "name": "중립안",
+            "basis": "4등급 중립",
+            "etf_policy": "S6_DEFENSIVE_V1 기준 배분 유지",
+            "stock_policy": "주식 후보 관찰/소액분할 검토",
+            "stock_weight_range_pct": "10~20",
+            "cash_or_defensive_weight": "중립 이상 유지",
+            "activation_condition": "기본 적용",
+        }
+    ]
 
 
 def attach_live_snapshot(stocks, asof_date):
@@ -993,6 +1550,7 @@ def build_report(asof_date):
         else infer_market_risk(market_status)
     )
     market_context_for_report = historical_snapshot.get("market_news_context", {}) if historical_snapshot else market_context
+    market_risk = apply_step1_v2_assessment(market_risk, asof_date, market_context_for_report)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
     model_concentration = build_model_concentration_explanation(
@@ -1019,6 +1577,7 @@ def build_report(asof_date):
         "etf_strategy": {
             "selected_model": "S6_DEFENSIVE_V1",
             "reason": build_etf_strategy_reason(market_risk),
+            "portfolio_scenarios": build_step2_portfolio_scenarios(market_risk),
             "s6_allocation": s6,
             "e_series_reference": {
                 "as_of_date": e_policy.get("as_of_date"),
@@ -1044,8 +1603,8 @@ def build_report(asof_date):
             "candidates": live["items"],
         },
         "process_steps": [
-            {"step": 1, "name": "시장 위험 판단", "result": market_risk["rating"]},
-            {"step": 2, "name": "ETF 전략 선택", "result": "S6_DEFENSIVE_V1 우선"},
+            {"step": 1, "name": "시장 위험 판단", "result": market_rating_text(market_risk)},
+            {"step": 2, "name": "ETF 전략 선택", "result": build_final_process_result(market_risk)},
             {"step": 3, "name": "E-series ETF 참고", "result": "shadow/admin reference, 공개 추천 제외"},
             {"step": 4, "name": "주식 모델 후보 점검", "result": "S2/S3/T/I 중복 선정 종목 중심"},
             {"step": 5, "name": "정성 분석과 최신 수급 확인", "result": "Kiwoom 조회 기준으로 추격매수 제한"},
@@ -1479,6 +2038,12 @@ def build_dynamic_model_conclusion(market_risk, top_models, decision_counts, nar
 def build_step_details(market_risk, market_context, s6, e_policy, live):
     breadth = market_risk.get("breadth", [])
     flows = market_risk.get("flows", [])
+    step1 = market_risk.get("step1_v2") or {}
+    axis_text = []
+    for axis in step1.get("axes", []):
+        axis_text.append(f"{axis.get('axis')}: {axis.get('score')}/{axis.get('max_score')}점")
+        for reason in axis.get("reasons", [])[:2]:
+            axis_text.append(f"{axis.get('axis')} 근거: {reason}")
     flow_text = []
     for row in flows:
         flow_text.append(f"{row.get('signal_name')}: {fmt(row.get('metric_value'))}{row.get('metric_unit', '')}({row.get('direction_label')})")
@@ -1502,8 +2067,10 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
             "title": "시장 위험 판단",
             "summary": build_market_step_summary(market_risk),
             "details": [
-                f"시장판단은 {market_risk.get('rating')}이다.",
-                f"시장 방향은 {market_risk.get('direction_label')}, 총점은 {market_risk.get('total_score')}, 위험점수는 {market_risk.get('risk_score')}이다.",
+                f"시장판단은 {market_rating_text(market_risk)}이다.",
+                f"STEP1 v2 점수는 {step1.get('score')}점, 기준 시점은 {step1.get('effective_asof') or market_risk.get('asof')}이다.",
+                f"기존 판단은 {market_risk.get('legacy_rating') or step1.get('legacy_rating')}였다.",
+                *axis_text,
                 *breadth_text,
                 *flow_text,
                 "중동, 유가, 금리, 반도체 변동성 관련 뉴스가 리스크 요인으로 반영됐다.",
@@ -1517,6 +2084,10 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
             "details": [
                 f"S6 최신 리밸런싱 기준일은 {s6.get('rebalance_date')}이다.",
                 f"현금성/단기채 성격 비중은 약 {round(cash_like, 1)}%, 달러/금/인버스/장기채 방어 비중은 약 {round(hedge_like, 1)}%이다.",
+                *[
+                    f"{row.get('scenario')}안 {row.get('name')}: {row.get('basis')} / 주식 {row.get('stock_weight_range_pct')}% / {row.get('activation_condition')}"
+                    for row in build_step2_portfolio_scenarios(market_risk)
+                ],
                 "구성은 단기금리, 달러채권, 금, 인버스, 장기채, 현금으로 분산되어 있다.",
             ],
             "conclusion": build_etf_step_conclusion(market_risk),
@@ -1579,6 +2150,10 @@ def write_markdown(report, path):
     lines.append(f"- 생성시각: {report['generated_at']}")
     lines.append(f"- 실행구분: {report.get('run_session')}")
     lines.append(f"- 시장판단: {report['market_risk']['rating']}")
+    step1 = report["market_risk"].get("step1_v2") or {}
+    if step1:
+        lines.append(f"- STEP1 v2: {step1.get('score')}점 / {step1.get('display_rating')} / 기준시점 {step1.get('effective_asof')}")
+        lines.append(f"- 기존 판단: {step1.get('legacy_rating')}")
     lines.append("")
     lines.append("## 단계별 판단")
     for step in report["process_steps"]:
@@ -1618,10 +2193,18 @@ def write_markdown(report, path):
     mr = report["market_risk"]
     lines.append(f"- 방향: {mr.get('direction_label')} / 총점 {mr.get('total_score')} / 위험점수 {mr.get('risk_score')}")
     lines.append(f"- 실행: {mr.get('action')}")
+    if step1:
+        for axis in step1.get("axes", []):
+            lines.append(f"- {axis.get('axis')}: {axis.get('score')}/{axis.get('max_score')}점")
     lines.append("")
     lines.append("## ETF 전략")
     lines.append(f"- 선택 모델: {report['etf_strategy']['selected_model']}")
     lines.append(f"- 판단: {report['etf_strategy']['reason']}")
+    for scenario in report["etf_strategy"].get("portfolio_scenarios", []):
+        lines.append(
+            f"- {scenario.get('scenario')}안 {scenario.get('name')}: {scenario.get('basis')}, "
+            f"주식 {scenario.get('stock_weight_range_pct')}%, {scenario.get('activation_condition')}"
+        )
     lines.append("")
     lines.append("| 코드 | 종목 | 역할 | 비중 |")
     lines.append("|---|---:|---:|---:|".replace("---:", "---"))
@@ -1773,6 +2356,13 @@ def init_portfolio_schema(con):
     ensure_column(con, "portfolio_model_explanations", "generation_method", "TEXT")
     ensure_column(con, "portfolio_model_explanations", "generation_model", "TEXT")
     ensure_column(con, "portfolio_model_explanations", "generation_status", "TEXT")
+    ensure_column(con, "portfolio_runs", "market_legacy_rating", "TEXT")
+    ensure_column(con, "portfolio_runs", "market_step1_v2_grade", "INTEGER")
+    ensure_column(con, "portfolio_runs", "market_step1_v2_label", "TEXT")
+    ensure_column(con, "portfolio_runs", "market_step1_v2_score", "REAL")
+    ensure_column(con, "portfolio_runs", "market_step1_v2_is_boundary", "INTEGER")
+    ensure_column(con, "portfolio_runs", "market_effective_asof", "TEXT")
+    ensure_column(con, "portfolio_runs", "market_logic_version", "TEXT")
 
 
 def migrate_portfolio_schema(con):
@@ -1979,6 +2569,7 @@ def save_report_to_db(report, json_path, md_path):
         init_portfolio_schema(con)
 
         market = report["market_risk"]
+        step1 = market.get("step1_v2") or {}
         stock_strategy = report["stock_strategy"]
         run_time = report["generated_at"]
         run_key = build_run_key(report["as_of_date"], run_time)
@@ -1988,9 +2579,12 @@ def save_report_to_db(report, json_path, md_path):
                 run_key, as_of_date, run_time, run_session, generated_at, page,
                 market_rating, market_total_score, market_risk_score,
                 selected_etf_model, stock_exposure_guidance, live_data_status,
-                live_data_source, json_path, md_path, report_json
+                live_data_source, json_path, md_path, report_json,
+                market_legacy_rating, market_step1_v2_grade, market_step1_v2_label,
+                market_step1_v2_score, market_step1_v2_is_boundary,
+                market_effective_asof, market_logic_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_key,
@@ -2009,6 +2603,13 @@ def save_report_to_db(report, json_path, md_path):
                 str(json_path),
                 str(md_path),
                 json.dumps(report, ensure_ascii=False),
+                market.get("legacy_rating") or step1.get("legacy_rating"),
+                step1.get("grade"),
+                step1.get("label"),
+                step1.get("score"),
+                1 if step1.get("is_boundary") else 0,
+                step1.get("effective_asof") or market.get("asof"),
+                step1.get("logic_version"),
             ),
         )
         run_id = cur.lastrowid
