@@ -663,16 +663,33 @@ def request_kiwoom_investor_amount(token, ticker, asof_date):
     }
 
 
+def classify_market_rating(total_score, risk_score):
+    if total_score is None:
+        return "Neutral Watch"
+    if total_score < 0.2 and risk_score is not None and risk_score > 0.5:
+        return "Defensive Caution"
+    if total_score >= 1.2 and (risk_score is None or risk_score <= 0.3):
+        return "Constructive Watch"
+    if total_score >= 0.4:
+        return "Neutral Watch"
+    return "Cautious Watch"
+
+
+def refresh_market_risk_rating(market_risk):
+    refreshed = dict(market_risk)
+    rating = classify_market_rating(refreshed.get("total_score"), refreshed.get("risk_score"))
+    refreshed["rating"] = rating
+    refreshed["action"] = build_market_action(rating)
+    return refreshed
+
+
 def infer_market_risk(market_status):
     state = market_status.get("intraday_context", {}).get("state", {})
     breadth = market_status.get("intraday_context", {}).get("breadth", [])
     flows = market_status.get("intraday_context", {}).get("flow_signals", [])
     total_score = state.get("total_score")
     risk_score = state.get("risk_score")
-    if total_score is not None and total_score < 0.2 and risk_score is not None and risk_score > 0.5:
-        rating = "Defensive Caution"
-    else:
-        rating = "Neutral Watch"
+    rating = classify_market_rating(total_score, risk_score)
     return {
         "rating": rating,
         "asof": market_status.get("asof"),
@@ -685,17 +702,35 @@ def infer_market_risk(market_status):
         "summary": state.get("summary_line"),
         "breadth": breadth,
         "flows": flows,
-        "action": "주식 추격매수보다 ETF/현금/방어자산 우선. 주식은 선별 관찰과 소액 분할만 검토.",
+        "action": build_market_action(rating),
     }
 
 
 def is_defensive_caution(market_risk):
-    return market_risk.get("rating") == "Defensive Caution"
+    return market_risk.get("rating") in {"Defensive Caution", "Cautious Watch"}
+
+
+def is_constructive_watch(market_risk):
+    return market_risk.get("rating") == "Constructive Watch"
+
+
+def build_market_action(rating):
+    if rating == "Constructive Watch":
+        return "시장 흐름은 강세 우위다. 주식 후보는 추격매수보다 수급 확인 후 단계적 편입을 검토한다."
+    if rating == "Neutral Watch":
+        return "중립 관찰 구간이다. 주식은 선별 관찰과 소액 분할만 검토한다."
+    if rating == "Cautious Watch":
+        return "약한 경계 구간이다. ETF/현금성 자산을 우선하고 주식 신규 편입은 제한한다."
+    return "주식 추격매수보다 ETF/현금/방어자산 우선. 주식은 선별 관찰과 소액 분할만 검토."
 
 
 def build_etf_strategy_reason(market_risk):
-    if is_defensive_caution(market_risk):
+    if market_risk.get("rating") == "Defensive Caution":
         return "시장 위험 신호가 높아 위험자산 노출을 낮추는 S6 방어형 ETF 모델을 우선 적용한다."
+    if market_risk.get("rating") == "Cautious Watch":
+        return "시장은 완전한 위험 회피 구간은 아니지만 경계 신호가 있어 S6 방어 배분을 유지한다."
+    if is_constructive_watch(market_risk):
+        return "시장 강도는 우호적이나 수급 확인과 이벤트 리스크가 남아 있어 S6 방어 배분을 기본축으로 유지하고 주식 편입은 단계적으로 검토한다."
     return (
         "시장판단은 Neutral Watch로 위험 고조 단계는 아니지만, 아직 관찰이 필요한 구간이므로 "
         "주식 비중을 성급히 늘리지 않고 S6 방어 배분을 유지한다."
@@ -703,27 +738,89 @@ def build_etf_strategy_reason(market_risk):
 
 
 def build_market_step_summary(market_risk):
-    if is_defensive_caution(market_risk):
+    if market_risk.get("rating") == "Defensive Caution":
         return "시장 위험 신호가 높아 방어적 판단을 우선했다."
+    if market_risk.get("rating") == "Cautious Watch":
+        return "일부 지표가 약해진 경계 구간으로 판단했다. 공격적 비중 확대보다 방어적 확인이 필요하다."
+    if is_constructive_watch(market_risk):
+        return "시장 방향과 종목 확산은 강세다. 다만 수급 데이터 공백과 이벤트 리스크가 있어 강세 관찰 구간으로 판단했다."
     return "시장판단은 중립 관찰 구간이다. 위험이 높다고 보지는 않지만, 추격매수보다 확인 후 대응이 필요한 상태로 판단했다."
 
 
 def build_market_step_conclusion(market_risk):
-    if is_defensive_caution(market_risk):
+    if market_risk.get("rating") == "Defensive Caution":
         return "오늘은 공격적 주식 매수보다 방어형 자산과 현금성 자산을 우선한다."
+    if market_risk.get("rating") == "Cautious Watch":
+        return "오늘은 주식 신규 편입을 제한하고 방어 배분을 유지한다."
+    if is_constructive_watch(market_risk):
+        return "오늘은 주식 비중 확대를 검토할 수 있지만, 추격매수보다 수급 확인 후 단계적으로 접근한다."
     return "오늘은 주식 비중을 0%로 낮출 상황은 아니지만, 신규 매수는 관찰/소액 분할 중심으로 제한한다."
 
 
 def build_etf_step_summary(market_risk):
-    if is_defensive_caution(market_risk):
+    if market_risk.get("rating") == "Defensive Caution":
         return "시장 위험이 높은 구간이므로 위험자산 편입을 줄이고 방어형 ETF 모델인 S6를 우선 적용했다."
+    if market_risk.get("rating") == "Cautious Watch":
+        return "경계 구간이므로 S6 ETF 배분을 방어축으로 유지했다."
+    if is_constructive_watch(market_risk):
+        return "시장 강도는 우호적이지만 이벤트 리스크와 수급 확인 필요성이 남아 있어 S6 ETF 배분을 기본축으로 유지했다."
     return "시장 위험이 높아서가 아니라 중립 관찰 구간이므로, 포트폴리오의 기본 방어축으로 S6 ETF 배분을 유지했다."
 
 
 def build_etf_step_conclusion(market_risk):
-    if is_defensive_caution(market_risk):
+    if market_risk.get("rating") == "Defensive Caution":
         return "포트폴리오의 중심은 S6 방어 배분으로 두는 것이 합리적이다."
+    if market_risk.get("rating") == "Cautious Watch":
+        return "S6는 경계 구간에서 변동성을 낮추는 기준 배분으로 해석한다."
+    if is_constructive_watch(market_risk):
+        return "S6는 강세를 부정하는 신호가 아니라, 주식 편입을 단계적으로 늘리기 전 유지하는 기준 배분이다."
     return "S6는 위험 회피 신호가 아니라, 중립 구간에서 현금성/방어자산 비중을 유지하는 기준 배분으로 해석한다."
+
+
+def build_final_step_summary(market_risk):
+    if is_constructive_watch(market_risk):
+        return "시장 강도는 우호적이지만 ETF 모델, 주식 후보, 수급 확인을 종합하면 단계적 주식 편입과 S6 기준 배분 병행이 결론이다."
+    if market_risk.get("rating") == "Neutral Watch":
+        return "시장 위험, ETF 모델, 주식 후보, 수급 확인을 종합하면 오늘은 S6 기준 배분을 유지하며 주식은 제한적으로 검토하는 결론이다."
+    return "시장 위험, ETF 모델, 주식 후보, 수급 확인을 종합하면 오늘은 방어형 ETF 중심 포트폴리오가 결론이다."
+
+
+def build_final_step_conclusion(market_risk):
+    if is_constructive_watch(market_risk):
+        return "최종 결론은 S6 기준 배분을 유지하되, 주식은 수급 개선 종목부터 단계적 편입을 검토하는 것이다."
+    if market_risk.get("rating") == "Neutral Watch":
+        return "최종 결론은 S6 기준 배분 유지, 주식은 관찰/소액 분할 검토이다."
+    return "최종 결론은 ETF 방어 배분 우선, 주식은 관찰/소액 분할 검토이다."
+
+
+def build_step6_first_detail(market_risk):
+    if is_constructive_watch(market_risk):
+        return "ETF는 S6 기준 배분을 유지하되, 주식 편입 가능성을 함께 검토한다."
+    return "ETF는 S6 방어 배분을 중심으로 한다."
+
+
+def build_stock_exposure_guidance(market_risk):
+    if is_constructive_watch(market_risk):
+        return "오늘 주식 비중은 0% 고정이 아니라 수급이 확인되는 종목부터 단계적 편입을 검토."
+    if market_risk.get("rating") == "Neutral Watch":
+        return "오늘 주식 비중은 0% 고정이 아니라 최대 10~20% 이내 관찰/소액 분할 검토."
+    return "오늘 주식 신규 편입은 제한하고 방어 배분을 우선."
+
+
+def build_final_process_result(market_risk):
+    if is_constructive_watch(market_risk):
+        return "S6 기준 배분 유지 + 주식 단계적 편입 검토"
+    if market_risk.get("rating") == "Neutral Watch":
+        return "S6 기준 배분 유지, 주식은 제한 비중"
+    return "ETF 방어 배분 중심, 주식은 제한 비중"
+
+
+def build_stock_candidate_step_conclusion(market_risk):
+    if is_constructive_watch(market_risk):
+        return "주식 후보는 유지하고, 수급과 가격 조건이 개선되는 종목부터 단계적 편입을 검토한다."
+    if market_risk.get("rating") == "Neutral Watch":
+        return "주식 후보는 유지하되 오늘 전체 주식 비중은 최대 10~20% 이내로 제한한다."
+    return "주식 후보는 유지하되 신규 편입은 제한하고 관찰 중심으로 관리한다."
 
 
 def attach_live_snapshot(stocks, asof_date):
@@ -890,7 +987,11 @@ def build_report(asof_date):
     stocks = stock_model_summary()
     live = attach_live_snapshot(stocks, asof_date)
     historical_snapshot = load_historical_portfolio_snapshot(asof_date)
-    market_risk = historical_snapshot.get("market_risk") if historical_snapshot else infer_market_risk(market_status)
+    market_risk = (
+        refresh_market_risk_rating(historical_snapshot.get("market_risk", {}))
+        if historical_snapshot
+        else infer_market_risk(market_status)
+    )
     market_context_for_report = historical_snapshot.get("market_news_context", {}) if historical_snapshot else market_context
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
@@ -929,7 +1030,7 @@ def build_report(asof_date):
             },
         },
         "stock_strategy": {
-            "exposure_guidance": "오늘 주식 비중은 0% 고정이 아니라 최대 10~20% 이내 관찰/소액 분할 검토.",
+            "exposure_guidance": build_stock_exposure_guidance(market_risk),
             "execution_rule": "외국인 매도와 당일 급락/급등 종목은 추격 금지. 기관/외국인 수급이 동시 개선되는 종목만 후보 유지.",
             "live_data": {
                 "status": live.get("status"),
@@ -948,7 +1049,7 @@ def build_report(asof_date):
             {"step": 3, "name": "E-series ETF 참고", "result": "shadow/admin reference, 공개 추천 제외"},
             {"step": 4, "name": "주식 모델 후보 점검", "result": "S2/S3/T/I 중복 선정 종목 중심"},
             {"step": 5, "name": "정성 분석과 최신 수급 확인", "result": "Kiwoom 조회 기준으로 추격매수 제한"},
-            {"step": 6, "name": "최종 포트폴리오 판단", "result": "ETF 방어 배분 중심, 주식은 제한 비중"},
+            {"step": 6, "name": "최종 포트폴리오 판단", "result": build_final_process_result(market_risk)},
         ],
         "step_details": step_details,
         "model_concentration_explanation": model_concentration,
@@ -1441,7 +1542,7 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 "현대차, 현대모비스, POSCO홀딩스, SK텔레콤, 대우건설은 핵심 후보군으로 분류했다.",
                 "SK하이닉스, 삼성전자, LG전자, LG, SK스퀘어는 관심은 높지만 추격매수 제한 그룹으로 분류했다.",
             ],
-            "conclusion": "주식 후보는 유지하되 오늘 전체 주식 비중은 최대 10~20% 이내로 제한한다.",
+            "conclusion": build_stock_candidate_step_conclusion(market_risk),
         },
         {
             "step": 5,
@@ -1458,14 +1559,14 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
         {
             "step": 6,
             "title": "최종 포트폴리오 판단",
-            "summary": "시장 위험, ETF 모델, 주식 후보, 수급 확인을 종합하면 오늘은 방어형 ETF 중심 포트폴리오가 결론이다.",
+            "summary": build_final_step_summary(market_risk),
             "details": [
-                "ETF는 S6 방어 배분을 중심으로 한다.",
+                build_step6_first_detail(market_risk),
                 "주식은 0% 고정은 아니지만 신규 편입은 제한적으로만 검토한다.",
                 "추격매수 보류 종목은 관심 목록에 남기되 매수 실행 종목으로 표시하지 않는다.",
                 "시장 확산력과 외국인 수급이 개선되면 주식 비중 확대 여부를 다시 판단한다.",
             ],
-            "conclusion": "최종 결론은 ETF 방어 배분 우선, 주식은 관찰/소액 분할 검토이다.",
+            "conclusion": build_final_step_conclusion(market_risk),
         },
     ]
 
