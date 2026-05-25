@@ -1380,6 +1380,198 @@ def build_step2_portfolio_scenarios(market_risk):
     ]
 
 
+def build_step3_etf_scenario_reference(scenarios, e_policy):
+    out = []
+    e_code = e_policy.get("strategy_model_code")
+    e_date = e_policy.get("as_of_date")
+    for scenario in scenarios:
+        code = scenario.get("scenario")
+        if code == "A":
+            interpretation = "E-series는 S6 방어 배분을 대체하지 않고 ETF 전략 참고 신호로만 사용한다."
+            usage = "보수안에서는 S6를 우선하고 E-series는 편입 확대 근거로 쓰지 않는다."
+        else:
+            interpretation = "E-series 신호가 성장/모멘텀 ETF와 같은 방향일 때 조건부 공격안의 보조 근거로 사용한다."
+            usage = "조건부 공격안에서는 E-series가 위험선호 회복을 확인할 때 ETF 노출 조정 참고자료로 쓴다."
+        out.append(
+            {
+                "scenario": code,
+                "scenario_name": scenario.get("name"),
+                "basis": scenario.get("basis"),
+                "e_series_model": e_code,
+                "e_series_as_of_date": e_date,
+                "interpretation": interpretation,
+                "usage": usage,
+                "public_recommendation_allowed": e_policy.get("governance", {}).get("public_recommendation_allowed"),
+            }
+        )
+    return out
+
+
+def candidate_flow_state(live_quote):
+    foreign = live_quote.get("foreign_net_억원")
+    institution = live_quote.get("institution_net_억원")
+    foreign = foreign if isinstance(foreign, (int, float)) else 0
+    institution = institution if isinstance(institution, (int, float)) else 0
+    net = foreign + institution
+    if foreign > 0 and institution > 0:
+        return "positive", net
+    if net > 0 and institution > 0:
+        return "mixed_positive", net
+    if foreign < 0 and institution < 0:
+        return "negative", net
+    return "mixed", net
+
+
+def candidate_price_state(live_quote):
+    change = live_quote.get("change_pct")
+    if not isinstance(change, (int, float)):
+        return "unknown"
+    if change >= 5:
+        return "overheated"
+    if change <= -5:
+        return "falling"
+    if -2 <= change <= 3:
+        return "stable"
+    return "volatile"
+
+
+def build_candidate_scenario_decisions(row, scenarios):
+    live_quote = row.get("live_quote") or {}
+    flow_state, net_flow = candidate_flow_state(live_quote)
+    price_state = candidate_price_state(live_quote)
+    is_core = row.get("group") == "core_candidate"
+    model_count = row.get("model_count") or 0
+    out = []
+    for scenario in scenarios:
+        code = scenario.get("scenario")
+        if code == "A":
+            if "소액" in row.get("decision", "") and price_state in {"stable", "unknown"}:
+                decision = "소액/관찰"
+                weight = "1~3%"
+                condition = "기본안 내 제한 편입 가능"
+            elif is_core and flow_state in {"positive", "mixed_positive"} and price_state != "overheated":
+                decision = "관찰/소액후보"
+                weight = "0~2%"
+                condition = "가격 안정 유지 시 소액 검토"
+            else:
+                decision = "보류/관찰"
+                weight = "0%"
+                condition = "수급과 가격 안정 재확인"
+        else:
+            if is_core and model_count >= 2 and flow_state in {"positive", "mixed_positive"} and price_state != "overheated":
+                decision = "단계적 편입검토"
+                weight = "2~5%"
+                condition = "외국인/기관 수급 개선 유지"
+            elif is_core and price_state != "overheated":
+                decision = "조건부 소액검토"
+                weight = "1~3%"
+                condition = "외국인 매도 완화 또는 기관 매수 지속"
+            elif model_count >= 2 and price_state == "stable" and flow_state != "negative":
+                decision = "조건부 관찰"
+                weight = "0~2%"
+                condition = "급등 없이 수급 개선 확인"
+            else:
+                decision = "추격 보류"
+                weight = "0%"
+                condition = "가격 과열/수급 부담 해소 필요"
+        reason = (
+            f"모델 {model_count}개, 수급상태 {flow_state}, 순수급 {fmt(net_flow)}억원, "
+            f"가격상태 {price_state}"
+        )
+        out.append(
+            {
+                "scenario": code,
+                "scenario_name": scenario.get("name"),
+                "decision": decision,
+                "max_weight_hint": weight,
+                "activation_condition": condition,
+                "reason": reason,
+            }
+        )
+    return out
+
+
+def apply_candidate_scenario_decisions(live, scenarios):
+    updated = dict(live)
+    items = []
+    for row in live.get("items", []):
+        item = dict(row)
+        item["scenario_decisions"] = build_candidate_scenario_decisions(item, scenarios)
+        items.append(item)
+    updated["items"] = items
+    return updated
+
+
+def build_stock_scenario_summary(candidates, scenarios):
+    out = []
+    for scenario in scenarios:
+        code = scenario.get("scenario")
+        counts = Counter()
+        for row in candidates:
+            for decision in row.get("scenario_decisions", []):
+                if decision.get("scenario") == code:
+                    counts.update([decision.get("decision")])
+        out.append(
+            {
+                "scenario": code,
+                "scenario_name": scenario.get("name"),
+                "basis": scenario.get("basis"),
+                "decision_counts": dict(counts),
+                "interpretation": (
+                    "보수안은 후보 유지와 제한 비중 관리가 핵심이다."
+                    if code == "A"
+                    else "조건부 공격안은 수급 개선 종목부터 단계적으로 편입한다."
+                ),
+            }
+        )
+    return out
+
+
+def build_step5_validation_scenarios(scenarios):
+    out = []
+    for scenario in scenarios:
+        if scenario.get("scenario") == "A":
+            checks = [
+                "외국인/프로그램 매도가 지속되면 신규 편입을 보류한다.",
+                "급등 종목은 추격하지 않고 가격 안정 후 재점검한다.",
+                "소액 후보도 종목별 손실 제한 기준을 둔다.",
+            ]
+        else:
+            checks = [
+                "외국인 매도 완화 또는 기관·외국인 동시 개선을 확인한다.",
+                "KOSDAQ 강세가 후보 종목 수급으로 확산되는지 확인한다.",
+                "환율과 금리 부담이 완화될 때만 주식 비중을 늘린다.",
+            ]
+        out.append(
+            {
+                "scenario": scenario.get("scenario"),
+                "scenario_name": scenario.get("name"),
+                "checks": checks,
+            }
+        )
+    return out
+
+
+def build_final_portfolio_strategy(market_risk, scenarios):
+    step1 = market_risk.get("step1_v2") or {}
+    default = scenarios[0] if scenarios else {}
+    conditional = scenarios[1] if len(scenarios) > 1 else None
+    transition_conditions = [
+        "외국인/프로그램 매도 완화",
+        "기관 매수 유지 또는 외국인·기관 동시 개선",
+        "후보 종목의 가격 과열 완화",
+        "환율/금리 리스크 완화",
+    ]
+    return {
+        "step1_rating": market_rating_text(market_risk),
+        "step1_score": step1.get("score"),
+        "default_scenario": default,
+        "conditional_scenario": conditional,
+        "transition_conditions": transition_conditions if conditional else [],
+        "conclusion": build_final_step_conclusion(market_risk),
+    }
+
+
 def attach_live_snapshot(stocks, asof_date):
     if os.getenv("QUANTANALYSIS_DISABLE_KIWOOM_LIVE") != "1":
         return attach_kiwoom_live_snapshot(stocks, asof_date)
@@ -1551,6 +1743,8 @@ def build_report(asof_date):
     )
     market_context_for_report = historical_snapshot.get("market_news_context", {}) if historical_snapshot else market_context
     market_risk = apply_step1_v2_assessment(market_risk, asof_date, market_context_for_report)
+    portfolio_scenarios = build_step2_portfolio_scenarios(market_risk)
+    live = apply_candidate_scenario_decisions(live, portfolio_scenarios)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
     model_concentration = build_model_concentration_explanation(
@@ -1577,7 +1771,8 @@ def build_report(asof_date):
         "etf_strategy": {
             "selected_model": "S6_DEFENSIVE_V1",
             "reason": build_etf_strategy_reason(market_risk),
-            "portfolio_scenarios": build_step2_portfolio_scenarios(market_risk),
+            "portfolio_scenarios": portfolio_scenarios,
+            "e_series_scenario_reference": build_step3_etf_scenario_reference(portfolio_scenarios, e_policy),
             "s6_allocation": s6,
             "e_series_reference": {
                 "as_of_date": e_policy.get("as_of_date"),
@@ -1591,6 +1786,8 @@ def build_report(asof_date):
         "stock_strategy": {
             "exposure_guidance": build_stock_exposure_guidance(market_risk),
             "execution_rule": "외국인 매도와 당일 급락/급등 종목은 추격 금지. 기관/외국인 수급이 동시 개선되는 종목만 후보 유지.",
+            "scenario_summary": build_stock_scenario_summary(live["items"], portfolio_scenarios),
+            "validation_scenarios": build_step5_validation_scenarios(portfolio_scenarios),
             "live_data": {
                 "status": live.get("status"),
                 "source": live.get("source"),
@@ -1611,6 +1808,7 @@ def build_report(asof_date):
             {"step": 6, "name": "최종 포트폴리오 판단", "result": build_final_process_result(market_risk)},
         ],
         "step_details": step_details,
+        "final_portfolio_strategy": build_final_portfolio_strategy(market_risk, portfolio_scenarios),
         "model_concentration_explanation": model_concentration,
         "disclaimer": "본 자료는 Quant 모델 기반 투자정보 정리이며 매수/매도 권유가 아니다.",
     }
@@ -2035,10 +2233,21 @@ def build_dynamic_model_conclusion(market_risk, top_models, decision_counts, nar
     return f"{model_text} 중심 후보 분포를 참고하되, 최종 포트폴리오는 시장위험, ETF 전략, 종목별 수급을 함께 반영해 결정한다."
 
 
+def format_counts(counts):
+    if not counts:
+        return "없음"
+    return ", ".join(f"{key} {value}개" for key, value in counts.items())
+
+
 def build_step_details(market_risk, market_context, s6, e_policy, live):
     breadth = market_risk.get("breadth", [])
     flows = market_risk.get("flows", [])
     step1 = market_risk.get("step1_v2") or {}
+    scenarios = build_step2_portfolio_scenarios(market_risk)
+    e_scenario_refs = build_step3_etf_scenario_reference(scenarios, e_policy)
+    stock_scenario_summary = build_stock_scenario_summary(live.get("items", []), scenarios)
+    validation_scenarios = build_step5_validation_scenarios(scenarios)
+    final_strategy = build_final_portfolio_strategy(market_risk, scenarios)
     axis_text = []
     for axis in step1.get("axes", []):
         axis_text.append(f"{axis.get('axis')}: {axis.get('score')}/{axis.get('max_score')}점")
@@ -2100,9 +2309,13 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 f"E-series 기준일은 {e_policy.get('as_of_date')}이다.",
                 f"운영 후보 정책은 {e_policy.get('active_primary_shadow_policy')}이다.",
                 f"공개 추천 허용 여부는 {e_policy.get('governance', {}).get('public_recommendation_allowed')}이다.",
+                *[
+                    f"{row.get('scenario')}안 {row.get('scenario_name')}: {row.get('usage')}"
+                    for row in e_scenario_refs
+                ],
                 "따라서 S6 실행 판단을 대체하지 않고 ETF 전략 검증 참고자료로만 사용한다.",
             ],
-            "conclusion": "현재 페이지에서는 E-series를 보조 판단 근거로만 표시한다.",
+            "conclusion": "E-series는 A안에서는 방어 유지 확인용, B안에서는 ETF 노출 확대 보조 확인용으로 분리해 사용한다.",
         },
         {
             "step": 4,
@@ -2112,6 +2325,10 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 "S2/S3/T/I 계열 중복 선정 종목을 우선 점검했다.",
                 "현대차, 현대모비스, POSCO홀딩스, SK텔레콤, 대우건설은 핵심 후보군으로 분류했다.",
                 "SK하이닉스, 삼성전자, LG전자, LG, SK스퀘어는 관심은 높지만 추격매수 제한 그룹으로 분류했다.",
+                *[
+                    f"{row.get('scenario')}안 {row.get('scenario_name')}: {format_counts(row.get('decision_counts'))}"
+                    for row in stock_scenario_summary
+                ],
             ],
             "conclusion": build_stock_candidate_step_conclusion(market_risk),
         },
@@ -2124,8 +2341,12 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 f"보류 판단 종목은 {hold_count}개, 관찰 판단 종목은 {watch_count}개, 소액 검토 종목은 {small_count}개이다.",
                 "외국인 매도가 큰 대형주는 모델 선정 여부와 무관하게 추격매수를 제한했다.",
                 "POSCO홀딩스와 SK텔레콤처럼 가격 변동이 작고 수급 부담이 낮은 종목만 소액/관찰 후보로 남겼다.",
+                *[
+                    f"{row.get('scenario')}안 검증: {' / '.join(row.get('checks', []))}"
+                    for row in validation_scenarios
+                ],
             ],
-            "conclusion": "정성적으로 좋아도 당일 수급과 가격이 불리하면 매수 판단을 보류한다.",
+            "conclusion": "정성적으로 좋아도 A안/B안별 수급, 가격, 리스크 조건을 통과해야 실행 후보로 남긴다.",
         },
         {
             "step": 6,
@@ -2136,6 +2357,14 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 "주식은 0% 고정은 아니지만 신규 편입은 제한적으로만 검토한다.",
                 "추격매수 보류 종목은 관심 목록에 남기되 매수 실행 종목으로 표시하지 않는다.",
                 "시장 확산력과 외국인 수급이 개선되면 주식 비중 확대 여부를 다시 판단한다.",
+                f"기본안은 {final_strategy.get('default_scenario', {}).get('name')}이며 주식 비중은 {final_strategy.get('default_scenario', {}).get('stock_weight_range_pct')}% 범위다.",
+                *(
+                    [
+                        f"조건부안은 {final_strategy.get('conditional_scenario', {}).get('name')}이며 전환조건은 {' / '.join(final_strategy.get('transition_conditions', []))}이다."
+                    ]
+                    if final_strategy.get("conditional_scenario")
+                    else []
+                ),
             ],
             "conclusion": build_final_step_conclusion(market_risk),
         },
@@ -2205,6 +2434,8 @@ def write_markdown(report, path):
             f"- {scenario.get('scenario')}안 {scenario.get('name')}: {scenario.get('basis')}, "
             f"주식 {scenario.get('stock_weight_range_pct')}%, {scenario.get('activation_condition')}"
         )
+    for ref in report["etf_strategy"].get("e_series_scenario_reference", []):
+        lines.append(f"- E-series {ref.get('scenario')}안 적용: {ref.get('usage')}")
     lines.append("")
     lines.append("| 코드 | 종목 | 역할 | 비중 |")
     lines.append("|---|---:|---:|---:|".replace("---:", "---"))
@@ -2217,16 +2448,31 @@ def write_markdown(report, path):
     if live_data.get("fetched_at"):
         lines.append(f"- 최신가/당일등락/외국인/기관 거래금액 조회시점: {live_data.get('fetched_at')} ({live_data.get('source')})")
     lines.append("")
-    lines.append("| 코드 | 종목 | 모델군 | 선정일 | 최신가 | 당일등락 | 외국인 | 기관 | 판단 |")
-    lines.append("|---|---|---|---|---:|---:|---:|---:|---|")
+    lines.append("| 코드 | 종목 | 모델군 | 선정일 | 최신가 | 당일등락 | 외국인 | 기관 | 기존판단 | A안 | B안 |")
+    lines.append("|---|---|---|---|---:|---:|---:|---:|---|---|---|")
     for row in report["stock_strategy"]["candidates"]:
         live = row.get("live_quote") or {}
         models = row.get("model_display") or " / ".join(row.get("model_display_codes") or row.get("model_ids") or row.get("model_groups", []))
+        scenario_map = {item.get("scenario"): item for item in row.get("scenario_decisions", [])}
+        a_decision = scenario_map.get("A", {}).get("decision", "-")
+        b_decision = scenario_map.get("B", {}).get("decision", "-")
         lines.append(
             f"| {row['ticker']} | {row['name']} | {models} | {row.get('latest_selection_date')} | "
             f"{fmt(live.get('price'))} | {fmt(live.get('change_pct'))}% | "
-            f"{fmt(live.get('foreign_net_억원'))}억 | {fmt(live.get('institution_net_억원'))}억 | {row['decision']} |"
+            f"{fmt(live.get('foreign_net_억원'))}억 | {fmt(live.get('institution_net_억원'))}억 | {row['decision']} | "
+            f"{a_decision} | {b_decision} |"
         )
+    final_strategy = report.get("final_portfolio_strategy", {})
+    if final_strategy:
+        lines.append("")
+        lines.append("## 최종 포트폴리오 시나리오")
+        default = final_strategy.get("default_scenario") or {}
+        conditional = final_strategy.get("conditional_scenario") or {}
+        lines.append(f"- 기본안: {default.get('name')} / {default.get('basis')} / 주식 {default.get('stock_weight_range_pct')}%")
+        if conditional:
+            lines.append(f"- 조건부안: {conditional.get('name')} / {conditional.get('basis')} / 주식 {conditional.get('stock_weight_range_pct')}%")
+            lines.append(f"- 전환조건: {' / '.join(final_strategy.get('transition_conditions', []))}")
+        lines.append(f"- 결론: {final_strategy.get('conclusion')}")
     lines.append("")
     lines.append(f"> {report['disclaimer']}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2342,6 +2588,34 @@ def init_portfolio_schema(con):
             conclusion TEXT,
             FOREIGN KEY (run_id) REFERENCES portfolio_runs(run_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS portfolio_scenarios (
+            run_id INTEGER NOT NULL,
+            scenario_code TEXT NOT NULL,
+            name TEXT,
+            basis TEXT,
+            etf_policy TEXT,
+            stock_policy TEXT,
+            stock_weight_range_pct TEXT,
+            cash_or_defensive_weight TEXT,
+            activation_condition TEXT,
+            is_default INTEGER,
+            PRIMARY KEY (run_id, scenario_code),
+            FOREIGN KEY (run_id) REFERENCES portfolio_runs(run_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS portfolio_stock_candidate_scenarios (
+            run_id INTEGER NOT NULL,
+            ticker TEXT NOT NULL,
+            scenario_code TEXT NOT NULL,
+            scenario_name TEXT,
+            decision TEXT,
+            max_weight_hint TEXT,
+            activation_condition TEXT,
+            reason TEXT,
+            PRIMARY KEY (run_id, ticker, scenario_code),
+            FOREIGN KEY (run_id) REFERENCES portfolio_runs(run_id) ON DELETE CASCADE
+        );
         """
     )
     ensure_column(con, "portfolio_stock_candidates", "model_ids", "TEXT")
@@ -2363,6 +2637,7 @@ def init_portfolio_schema(con):
     ensure_column(con, "portfolio_runs", "market_step1_v2_is_boundary", "INTEGER")
     ensure_column(con, "portfolio_runs", "market_effective_asof", "TEXT")
     ensure_column(con, "portfolio_runs", "market_logic_version", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "scenario_decisions_json", "TEXT")
 
 
 def migrate_portfolio_schema(con):
@@ -2668,11 +2943,62 @@ def save_report_to_db(report, json_path, md_path):
                 model_groups, model_ids, model_display_codes, model_display, model_count, selection_close, market_cap,
                 return_from_selection_pct, holding_days, qualitative_summary, live_price,
                 live_change_pct, foreign_net_억원, institution_net_억원,
-                individual_net_억원, pension_net_억원
+                individual_net_억원, pension_net_억원, scenario_decisions_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [stock_row(run_id, row) for row in report["stock_strategy"]["candidates"]],
+        )
+        scenarios = report["etf_strategy"].get("portfolio_scenarios", [])
+        con.executemany(
+            """
+            INSERT INTO portfolio_scenarios(
+                run_id, scenario_code, name, basis, etf_policy, stock_policy,
+                stock_weight_range_pct, cash_or_defensive_weight, activation_condition,
+                is_default
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    row.get("scenario"),
+                    row.get("name"),
+                    row.get("basis"),
+                    row.get("etf_policy"),
+                    row.get("stock_policy"),
+                    row.get("stock_weight_range_pct"),
+                    row.get("cash_or_defensive_weight"),
+                    row.get("activation_condition"),
+                    1 if idx == 0 else 0,
+                )
+                for idx, row in enumerate(scenarios)
+            ],
+        )
+        scenario_rows = []
+        for row in report["stock_strategy"]["candidates"]:
+            for decision in row.get("scenario_decisions", []):
+                scenario_rows.append(
+                    (
+                        run_id,
+                        row.get("ticker"),
+                        decision.get("scenario"),
+                        decision.get("scenario_name"),
+                        decision.get("decision"),
+                        decision.get("max_weight_hint"),
+                        decision.get("activation_condition"),
+                        decision.get("reason"),
+                    )
+                )
+        con.executemany(
+            """
+            INSERT INTO portfolio_stock_candidate_scenarios(
+                run_id, ticker, scenario_code, scenario_name, decision,
+                max_weight_hint, activation_condition, reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            scenario_rows,
         )
         explanation = report.get("model_concentration_explanation")
         if explanation:
@@ -2746,6 +3072,7 @@ def stock_row(run_id, row):
         live.get("institution_net_억원"),
         live.get("individual_net_억원"),
         live.get("pension_net_억원"),
+        json.dumps(row.get("scenario_decisions", []), ensure_ascii=False),
     )
 
 
