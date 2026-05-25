@@ -689,6 +689,43 @@ def infer_market_risk(market_status):
     }
 
 
+def is_defensive_caution(market_risk):
+    return market_risk.get("rating") == "Defensive Caution"
+
+
+def build_etf_strategy_reason(market_risk):
+    if is_defensive_caution(market_risk):
+        return "시장 위험 신호가 높아 위험자산 노출을 낮추는 S6 방어형 ETF 모델을 우선 적용한다."
+    return (
+        "시장판단은 Neutral Watch로 위험 고조 단계는 아니지만, 아직 관찰이 필요한 구간이므로 "
+        "주식 비중을 성급히 늘리지 않고 S6 방어 배분을 유지한다."
+    )
+
+
+def build_market_step_summary(market_risk):
+    if is_defensive_caution(market_risk):
+        return "시장 위험 신호가 높아 방어적 판단을 우선했다."
+    return "시장판단은 중립 관찰 구간이다. 위험이 높다고 보지는 않지만, 추격매수보다 확인 후 대응이 필요한 상태로 판단했다."
+
+
+def build_market_step_conclusion(market_risk):
+    if is_defensive_caution(market_risk):
+        return "오늘은 공격적 주식 매수보다 방어형 자산과 현금성 자산을 우선한다."
+    return "오늘은 주식 비중을 0%로 낮출 상황은 아니지만, 신규 매수는 관찰/소액 분할 중심으로 제한한다."
+
+
+def build_etf_step_summary(market_risk):
+    if is_defensive_caution(market_risk):
+        return "시장 위험이 높은 구간이므로 위험자산 편입을 줄이고 방어형 ETF 모델인 S6를 우선 적용했다."
+    return "시장 위험이 높아서가 아니라 중립 관찰 구간이므로, 포트폴리오의 기본 방어축으로 S6 ETF 배분을 유지했다."
+
+
+def build_etf_step_conclusion(market_risk):
+    if is_defensive_caution(market_risk):
+        return "포트폴리오의 중심은 S6 방어 배분으로 두는 것이 합리적이다."
+    return "S6는 위험 회피 신호가 아니라, 중립 구간에서 현금성/방어자산 비중을 유지하는 기준 배분으로 해석한다."
+
+
 def attach_live_snapshot(stocks, asof_date):
     if os.getenv("QUANTANALYSIS_DISABLE_KIWOOM_LIVE") != "1":
         return attach_kiwoom_live_snapshot(stocks, asof_date)
@@ -880,7 +917,7 @@ def build_report(asof_date):
         },
         "etf_strategy": {
             "selected_model": "S6_DEFENSIVE_V1",
-            "reason": "시장 확산력 약화, 외국인 순매도, 프로그램 매도 우위로 위험자산 노출을 낮추는 방어형 ETF 모델이 적합.",
+            "reason": build_etf_strategy_reason(market_risk),
             "s6_allocation": s6,
             "e_series_reference": {
                 "as_of_date": e_policy.get("as_of_date"),
@@ -1362,7 +1399,7 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
         {
             "step": 1,
             "title": "시장 위험 판단",
-            "summary": "시장 전체가 상승 종목보다 하락 종목이 훨씬 많고, 외국인과 프로그램 매도 압력이 강해 방어적 판단을 우선했다.",
+            "summary": build_market_step_summary(market_risk),
             "details": [
                 f"시장판단은 {market_risk.get('rating')}이다.",
                 f"시장 방향은 {market_risk.get('direction_label')}, 총점은 {market_risk.get('total_score')}, 위험점수는 {market_risk.get('risk_score')}이다.",
@@ -1370,18 +1407,18 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 *flow_text,
                 "중동, 유가, 금리, 반도체 변동성 관련 뉴스가 리스크 요인으로 반영됐다.",
             ],
-            "conclusion": "오늘은 공격적 주식 매수보다 방어형 자산과 현금성 자산을 우선한다.",
+            "conclusion": build_market_step_conclusion(market_risk),
         },
         {
             "step": 2,
             "title": "ETF 전략 선택",
-            "summary": "시장 위험이 높은 구간이므로 위험자산 편입을 줄이고 방어형 ETF 모델인 S6를 우선 적용했다.",
+            "summary": build_etf_step_summary(market_risk),
             "details": [
                 f"S6 최신 리밸런싱 기준일은 {s6.get('rebalance_date')}이다.",
                 f"현금성/단기채 성격 비중은 약 {round(cash_like, 1)}%, 달러/금/인버스/장기채 방어 비중은 약 {round(hedge_like, 1)}%이다.",
                 "구성은 단기금리, 달러채권, 금, 인버스, 장기채, 현금으로 분산되어 있다.",
             ],
-            "conclusion": "포트폴리오의 중심은 S6 방어 배분으로 두는 것이 합리적이다.",
+            "conclusion": build_etf_step_conclusion(market_risk),
         },
         {
             "step": 3,
