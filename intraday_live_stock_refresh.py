@@ -2,8 +2,17 @@ import argparse
 import json
 import sqlite3
 from datetime import datetime, time
+from pathlib import Path
 
-from portfolio_pipeline import DB_PATH, KST, attach_kiwoom_live_snapshot, stock_model_summary
+from portfolio_pipeline import (
+    DB_PATH,
+    KST,
+    OUTPUT_DIR,
+    apply_candidate_scenario_decisions,
+    attach_kiwoom_live_snapshot,
+    publish_portfolio_to_gcs,
+    stock_model_summary,
+)
 
 
 def now_kst():
@@ -183,10 +192,96 @@ def save_refresh(live, asof_date):
         }
 
 
+def update_latest_portfolio_json(live, refresh_result):
+    if live.get("status") != "ok":
+        return {"status": "skipped", "reason": "live_status_not_ok"}
+    latest_path = OUTPUT_DIR / "investment_portfolio_latest.json"
+    if not latest_path.exists():
+        return {"status": "skipped", "reason": "latest_portfolio_json_missing"}
+
+    report = json.loads(latest_path.read_text(encoding="utf-8-sig"))
+    live_by_ticker = {
+        item.get("ticker"): item.get("live_quote")
+        for item in live.get("items", [])
+        if item.get("ticker") and item.get("live_quote")
+    }
+    candidates = report.get("stock_strategy", {}).get("candidates", [])
+    updated = 0
+    for candidate in candidates:
+        quote = live_by_ticker.get(candidate.get("ticker"))
+        if not quote:
+            continue
+        candidate["live_quote"] = quote
+        updated += 1
+
+    scenarios = report.get("etf_strategy", {}).get("portfolio_scenarios", [])
+    if scenarios:
+        refreshed_live = apply_candidate_scenario_decisions(
+            {
+                "status": live.get("status"),
+                "source": live.get("source"),
+                "asof_date": live.get("asof_date"),
+                "fetched_at": live.get("fetched_at"),
+                "success_count": live.get("success_count"),
+                "error_count": live.get("error_count"),
+                "errors": live.get("errors", []),
+                "items": candidates,
+            },
+            scenarios,
+        )
+        report["stock_strategy"]["candidates"] = refreshed_live["items"]
+
+    report.setdefault("stock_strategy", {})["live_data"] = {
+        "status": live.get("status"),
+        "source": live.get("source"),
+        "asof_date": live.get("asof_date"),
+        "fetched_at": live.get("fetched_at"),
+        "success_count": live.get("success_count"),
+        "error_count": live.get("error_count"),
+        "errors": live.get("errors", []),
+    }
+    report["intraday_live_refresh"] = {
+        "refresh_id": refresh_result.get("refresh_id"),
+        "run_id_updated": refresh_result.get("run_id_updated"),
+        "updated_candidates": refresh_result.get("updated_candidates"),
+        "snapshot_rows": refresh_result.get("snapshot_rows"),
+        "fetched_at": live.get("fetched_at"),
+        "status": live.get("status"),
+        "source": live.get("source"),
+    }
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(KST).strftime("%Y%m%d_%H%M%S%f")[:22]
+    archive_path = OUTPUT_DIR / f"investment_portfolio_live_refresh_{stamp}.json"
+    payload = json.dumps(report, ensure_ascii=False, indent=2)
+    latest_path.write_text(payload, encoding="utf-8")
+    archive_path.write_text(payload, encoding="utf-8")
+    return {
+        "status": "updated",
+        "updated_candidates": updated,
+        "latest_json": str(latest_path),
+        "archive_json": str(archive_path),
+    }
+
+
+def publish_live_portfolio_update(json_update_result, skip_gcs_publish):
+    if skip_gcs_publish or json_update_result.get("status") != "updated":
+        return {"status": "skipped"}
+    try:
+        publish_result = publish_portfolio_to_gcs(
+            Path(json_update_result["latest_json"]),
+            Path(json_update_result["archive_json"]),
+        )
+        return {"status": "ok", **publish_result}
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--asof", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--skip-gcs-publish", action="store_true")
     args = parser.parse_args()
 
     dt = now_kst()
@@ -198,6 +293,10 @@ def main():
     stocks = stock_model_summary()
     live = attach_kiwoom_live_snapshot(stocks, asof_date)
     result = save_refresh(live, asof_date)
+    json_update = update_latest_portfolio_json(live, result)
+    gcs_publish = publish_live_portfolio_update(json_update, args.skip_gcs_publish)
+    result["portfolio_json_update"] = json_update
+    result["gcs_publish"] = gcs_publish
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
