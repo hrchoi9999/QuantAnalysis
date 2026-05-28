@@ -389,6 +389,114 @@ def load_price_db_quotes(stocks, asof_date):
     return out
 
 
+def load_candidate_markets(stocks):
+    if not PRICE_DB_PATH.exists():
+        return {}
+    tickers = [stock["ticker"] for stock in stocks]
+    placeholders = ",".join("?" for _ in tickers)
+    query = f"""
+        SELECT ticker, market
+        FROM instrument_master
+        WHERE ticker IN ({placeholders})
+    """
+    try:
+        with sqlite3.connect(PRICE_DB_PATH) as con:
+            return {ticker: market for ticker, market in con.execute(query, tickers)}
+    except sqlite3.Error:
+        return {}
+
+
+def pct_return(latest, base):
+    if latest in (None, 0) or base in (None, 0):
+        return None
+    return round((float(latest) / float(base) - 1) * 100, 2)
+
+
+def load_index_return(index_name, asof_date, window):
+    if not MARKET_ANALYSIS_DB_PATH.exists():
+        return None
+    query = """
+        SELECT date, close
+        FROM market_index_daily
+        WHERE market = 'KR'
+          AND index_name = ?
+          AND date <= ?
+          AND close IS NOT NULL
+        ORDER BY date DESC
+        LIMIT ?
+    """
+    try:
+        with sqlite3.connect(market_db_uri(), uri=True) as con:
+            rows = con.execute(query, [index_name, asof_date, window + 1]).fetchall()
+    except sqlite3.Error:
+        return None
+    if len(rows) < 2:
+        return None
+    latest = rows[0][1]
+    base = rows[min(window, len(rows) - 1)][1]
+    return pct_return(latest, base)
+
+
+def load_candidate_momentum(stocks, asof_date):
+    if not PRICE_DB_PATH.exists():
+        return {}
+    tickers = [stock["ticker"] for stock in stocks]
+    placeholders = ",".join("?" for _ in tickers)
+    query = f"""
+        SELECT ticker, date, close, volume, value
+        FROM prices_daily
+        WHERE ticker IN ({placeholders})
+          AND date <= ?
+          AND close IS NOT NULL
+        ORDER BY ticker, date DESC
+    """
+    by_ticker = {ticker: [] for ticker in tickers}
+    try:
+        with sqlite3.connect(PRICE_DB_PATH) as con:
+            for ticker, date, close, volume, value in con.execute(query, [*tickers, asof_date]):
+                if len(by_ticker.setdefault(ticker, [])) < 12:
+                    by_ticker[ticker].append(
+                        {
+                            "date": date,
+                            "close": close,
+                            "volume": volume,
+                            "value": value,
+                        }
+                    )
+    except sqlite3.Error:
+        return {}
+
+    markets = load_candidate_markets(stocks)
+    index_returns = {
+        "KOSPI": load_index_return("KOSPI", asof_date, 5),
+        "KOSDAQ": load_index_return("KOSDAQ", asof_date, 5),
+    }
+    out = {}
+    for ticker, rows in by_ticker.items():
+        if not rows:
+            continue
+        latest = rows[0]
+        ret_1d = pct_return(latest["close"], rows[1]["close"]) if len(rows) > 1 else None
+        ret_5d = pct_return(latest["close"], rows[min(5, len(rows) - 1)]["close"]) if len(rows) > 1 else None
+        ret_10d = pct_return(latest["close"], rows[min(10, len(rows) - 1)]["close"]) if len(rows) > 1 else None
+        market = markets.get(ticker) or "KOSPI"
+        index_name = "KOSDAQ" if market == "KOSDAQ" else "KOSPI"
+        index_5d = index_returns.get(index_name)
+        rel_5d = round(ret_5d - index_5d, 2) if ret_5d is not None and index_5d is not None else None
+        out[ticker] = {
+            "price_date": latest["date"],
+            "market": market,
+            "benchmark_index": index_name,
+            "return_1d_pct": ret_1d,
+            "return_5d_pct": ret_5d,
+            "return_10d_pct": ret_10d,
+            "benchmark_return_5d_pct": index_5d,
+            "relative_return_5d_pct": rel_5d,
+            "latest_close": latest["close"],
+        }
+    return out
+
+
 def normalize_ticker(value):
     digits = "".join(ch for ch in str(value or "") if ch.isdigit())
     return digits.zfill(6) if digits else None
@@ -1435,17 +1543,173 @@ def candidate_price_state(live_quote):
     return "volatile"
 
 
+def market_grade(market_risk):
+    step1 = market_risk.get("step1_v2") or {}
+    grade = step1.get("grade")
+    return grade if isinstance(grade, int) else None
+
+
+def score_relative_strength(relative_5d):
+    if relative_5d is None:
+        return 10, "상대강도 데이터 부족"
+    if relative_5d >= 5:
+        return 30, f"5일 지수 대비 +{relative_5d}%p"
+    if relative_5d >= 2:
+        return 24, f"5일 지수 대비 +{relative_5d}%p"
+    if relative_5d >= 0:
+        return 18, f"5일 지수 대비 +{relative_5d}%p"
+    if relative_5d >= -3:
+        return 10, f"5일 지수 대비 {relative_5d}%p"
+    return 3, f"5일 지수 대비 {relative_5d}%p"
+
+
+def score_recent_price_action(momentum, live_quote):
+    change = live_quote.get("change_pct")
+    ret_5d = momentum.get("return_5d_pct")
+    score = 10
+    reasons = []
+    if isinstance(ret_5d, (int, float)):
+        if ret_5d >= 8:
+            score += 2
+            reasons.append(f"5일 +{ret_5d}%로 강하지만 과열 확인 필요")
+        elif ret_5d >= 2:
+            score += 8
+            reasons.append(f"5일 +{ret_5d}%")
+        elif ret_5d >= -2:
+            score += 4
+            reasons.append(f"5일 {ret_5d}%로 안정")
+        else:
+            score -= 5
+            reasons.append(f"5일 {ret_5d}%로 약화")
+    if isinstance(change, (int, float)):
+        if change >= 5:
+            score -= 8
+            reasons.append(f"당일 {change}% 급등, 추격 위험")
+        elif change <= -5:
+            score -= 8
+            reasons.append(f"당일 {change}% 급락")
+        elif -2 <= change <= 3:
+            score += 4
+            reasons.append(f"당일 {change}% 안정권")
+        else:
+            reasons.append(f"당일 {change}% 변동성")
+    return max(0, min(20, score)), reasons
+
+
+def score_candidate_flow(live_quote):
+    flow_state, net_flow = candidate_flow_state(live_quote)
+    if flow_state == "positive":
+        return 25, f"외국인/기관 동시 순매수, 합산 {fmt(net_flow)}억원"
+    if flow_state == "mixed_positive":
+        return 18, f"기관 중심 순수급 우위, 합산 {fmt(net_flow)}억원"
+    if flow_state == "mixed":
+        return 10, f"수급 혼조, 합산 {fmt(net_flow)}억원"
+    return 0, f"외국인/기관 동시 순매도, 합산 {fmt(net_flow)}억원"
+
+
+def build_candidate_reactivity(row, market_risk):
+    live_quote = row.get("live_quote") or {}
+    momentum = row.get("momentum") or {}
+    model_count = row.get("model_count") or 0
+    grade = market_grade(market_risk)
+    reasons = []
+
+    model_score = min(20, 8 + model_count * 4)
+    if row.get("group") == "core_candidate":
+        model_score = min(20, model_score + 3)
+    reasons.append(f"모델 교차 {model_count}개")
+
+    relative_score, relative_reason = score_relative_strength(momentum.get("relative_return_5d_pct"))
+    reasons.append(relative_reason)
+
+    price_score, price_reasons = score_recent_price_action(momentum, live_quote)
+    reasons.extend(price_reasons)
+
+    flow_score, flow_reason = score_candidate_flow(live_quote)
+    reasons.append(flow_reason)
+
+    score = model_score + relative_score + price_score + flow_score
+    if grade is not None and grade <= 3:
+        score -= 8
+        reasons.append("시장 3등급 이하라 실행 기준을 보수적으로 강화")
+    if candidate_price_state(live_quote) == "overheated":
+        score -= 8
+        reasons.append("당일 급등으로 추격매수 감점")
+    if candidate_price_state(live_quote) == "falling":
+        score -= 6
+        reasons.append("당일 급락으로 리스크 감점")
+    score = max(0, min(100, round(score, 1)))
+
+    if candidate_price_state(live_quote) == "overheated" and score >= 55:
+        status = "추격 금지"
+        decision = "추격 금지/관찰"
+    elif score >= 70:
+        status = "편입 우선"
+        decision = "소액분할검토"
+    elif score >= 55:
+        status = "소액 관찰"
+        decision = "관찰/소액후보"
+    elif score >= 40:
+        status = "관찰 유지"
+        decision = "관찰"
+    elif score >= 25:
+        status = "우선순위 하락"
+        decision = "우선순위 하락"
+    else:
+        status = "제외 대기"
+        decision = "제외 대기"
+
+    return {
+        "logic_version": "stock_reactivity_v1_20260528",
+        "score": score,
+        "status": status,
+        "decision": decision,
+        "components": {
+            "model_score": model_score,
+            "relative_strength_score": relative_score,
+            "price_action_score": price_score,
+            "flow_score": flow_score,
+        },
+        "reasons": reasons[:6],
+    }
+
+
+def apply_candidate_reactivity(live, market_risk, asof_date):
+    updated = dict(live)
+    momentum_by_ticker = load_candidate_momentum(live.get("items", []), asof_date)
+    items = []
+    for row in live.get("items", []):
+        item = dict(row)
+        item["base_decision"] = item.get("decision")
+        item["momentum"] = momentum_by_ticker.get(item.get("ticker"), {})
+        item["reactivity"] = build_candidate_reactivity(item, market_risk)
+        item["decision"] = item["reactivity"]["decision"]
+        items.append(item)
+    items.sort(key=lambda row: row.get("reactivity", {}).get("score", 0), reverse=True)
+    for idx, item in enumerate(items, start=1):
+        item["reactivity"]["rank"] = idx
+    updated["items"] = items
+    updated["reactivity_logic_version"] = "stock_reactivity_v1_20260528"
+    return updated
+
+
 def build_candidate_scenario_decisions(row, scenarios):
     live_quote = row.get("live_quote") or {}
     flow_state, net_flow = candidate_flow_state(live_quote)
     price_state = candidate_price_state(live_quote)
     is_core = row.get("group") == "core_candidate"
     model_count = row.get("model_count") or 0
+    reactivity = row.get("reactivity") or {}
+    reactivity_status = reactivity.get("status")
     out = []
     for scenario in scenarios:
         code = scenario.get("scenario")
         if code == "A":
-            if "소액" in row.get("decision", "") and price_state in {"stable", "unknown"}:
+            if reactivity_status in {"제외 대기", "우선순위 하락"}:
+                decision = reactivity_status
+                weight = "0%"
+                condition = "종목 반응성 회복 전까지 편입 제외"
+            elif "소액" in row.get("decision", "") and price_state in {"stable", "unknown"}:
                 decision = "소액/관찰"
                 weight = "1~3%"
                 condition = "기본안 내 제한 편입 가능"
@@ -1458,7 +1722,11 @@ def build_candidate_scenario_decisions(row, scenarios):
                 weight = "0%"
                 condition = "수급과 가격 안정 재확인"
         else:
-            if is_core and model_count >= 2 and flow_state in {"positive", "mixed_positive"} and price_state != "overheated":
+            if reactivity_status in {"제외 대기", "우선순위 하락"}:
+                decision = reactivity_status
+                weight = "0%"
+                condition = "최근 상대강도 또는 수급 회복 필요"
+            elif is_core and model_count >= 2 and flow_state in {"positive", "mixed_positive"} and price_state != "overheated":
                 decision = "단계적 편입검토"
                 weight = "2~5%"
                 condition = "외국인/기관 수급 개선 유지"
@@ -1476,7 +1744,7 @@ def build_candidate_scenario_decisions(row, scenarios):
                 condition = "가격 과열/수급 부담 해소 필요"
         reason = (
             f"모델 {model_count}개, 수급상태 {flow_state}, 순수급 {fmt(net_flow)}억원, "
-            f"가격상태 {price_state}"
+            f"가격상태 {price_state}, 반응성 {reactivity.get('score')}점/{reactivity_status}"
         )
         out.append(
             {
@@ -1525,6 +1793,45 @@ def build_stock_scenario_summary(candidates, scenarios):
             }
         )
     return out
+
+
+def build_stock_reactivity_summary(candidates):
+    counts = Counter((row.get("reactivity") or {}).get("status", "미분류") for row in candidates)
+    top = []
+    weak = []
+    for row in candidates:
+        item = {
+            "ticker": row.get("ticker"),
+            "name": row.get("name"),
+            "score": (row.get("reactivity") or {}).get("score"),
+            "status": (row.get("reactivity") or {}).get("status"),
+            "decision": row.get("decision"),
+            "return_5d_pct": (row.get("momentum") or {}).get("return_5d_pct"),
+            "relative_return_5d_pct": (row.get("momentum") or {}).get("relative_return_5d_pct"),
+        }
+        if len(top) < 3:
+            top.append(item)
+    for row in reversed(candidates):
+        if len(weak) >= 3:
+            break
+        weak.append(
+            {
+                "ticker": row.get("ticker"),
+                "name": row.get("name"),
+                "score": (row.get("reactivity") or {}).get("score"),
+                "status": (row.get("reactivity") or {}).get("status"),
+                "decision": row.get("decision"),
+                "return_5d_pct": (row.get("momentum") or {}).get("return_5d_pct"),
+                "relative_return_5d_pct": (row.get("momentum") or {}).get("relative_return_5d_pct"),
+            }
+        )
+    return {
+        "logic_version": "stock_reactivity_v1_20260528",
+        "status_counts": dict(counts),
+        "top_candidates": top,
+        "weak_candidates": weak,
+        "interpretation": "주간 모델 후보는 유지하되, 일간 포트폴리오에서는 최근 5거래일 상대강도와 수급으로 우선순위와 실행상태를 매일 재분류한다.",
+    }
 
 
 def build_step5_validation_scenarios(scenarios):
@@ -1744,6 +2051,7 @@ def build_report(asof_date):
     market_context_for_report = historical_snapshot.get("market_news_context", {}) if historical_snapshot else market_context
     market_risk = apply_step1_v2_assessment(market_risk, asof_date, market_context_for_report)
     portfolio_scenarios = build_step2_portfolio_scenarios(market_risk)
+    live = apply_candidate_reactivity(live, market_risk, asof_date)
     live = apply_candidate_scenario_decisions(live, portfolio_scenarios)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
@@ -1786,6 +2094,7 @@ def build_report(asof_date):
         "stock_strategy": {
             "exposure_guidance": build_stock_exposure_guidance(market_risk),
             "execution_rule": "외국인 매도와 당일 급락/급등 종목은 추격 금지. 기관/외국인 수급이 동시 개선되는 종목만 후보 유지.",
+            "reactivity_summary": build_stock_reactivity_summary(live["items"]),
             "scenario_summary": build_stock_scenario_summary(live["items"], portfolio_scenarios),
             "validation_scenarios": build_step5_validation_scenarios(portfolio_scenarios),
             "live_data": {
@@ -1803,8 +2112,8 @@ def build_report(asof_date):
             {"step": 1, "name": "시장 위험 판단", "result": market_rating_text(market_risk)},
             {"step": 2, "name": "ETF 전략 선택", "result": build_final_process_result(market_risk)},
             {"step": 3, "name": "E-series ETF 참고", "result": "shadow/admin reference, 공개 추천 제외"},
-            {"step": 4, "name": "주식 모델 후보 점검", "result": "S2/S3/T/I 중복 선정 종목 중심"},
-            {"step": 5, "name": "정성 분석과 최신 수급 확인", "result": "Kiwoom 조회 기준으로 추격매수 제한"},
+            {"step": 4, "name": "주식 모델 후보 점검", "result": "종목별 반응성 점수로 일간 재정렬"},
+            {"step": 5, "name": "정성 분석과 최신 수급 확인", "result": "Kiwoom 수급과 최근 상대강도로 실행상태 재분류"},
             {"step": 6, "name": "최종 포트폴리오 판단", "result": build_final_process_result(market_risk)},
         ],
         "step_details": step_details,
@@ -2269,6 +2578,9 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
     hold_count = sum(1 for row in candidates if "보류" in row.get("decision", ""))
     watch_count = sum(1 for row in candidates if "관찰" in row.get("decision", ""))
     small_count = sum(1 for row in candidates if "소액" in row.get("decision", ""))
+    reactivity_counts = Counter((row.get("reactivity") or {}).get("status", "미분류") for row in candidates)
+    top_reactivity = candidates[:3]
+    weak_reactivity = list(reversed(candidates[-3:])) if len(candidates) >= 3 else []
 
     return [
         {
@@ -2320,11 +2632,19 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
         {
             "step": 4,
             "title": "주식 모델 후보 점검",
-            "summary": "주식은 모델 중복 선정 종목을 중심으로 보되, 오늘 시장 상황에서는 적극 매수보다 후보 관리에 초점을 둔다.",
+            "summary": "주식은 모델 후보를 그대로 두지 않고 최근 5거래일 상대강도와 수급으로 매일 우선순위를 재정렬한다.",
             "details": [
                 "S2/S3/T/I 계열 중복 선정 종목을 우선 점검했다.",
-                "현대차, 현대모비스, POSCO홀딩스, SK텔레콤, 대우건설은 핵심 후보군으로 분류했다.",
-                "SK하이닉스, 삼성전자, LG전자, LG, SK스퀘어는 관심은 높지만 추격매수 제한 그룹으로 분류했다.",
+                "최근 5거래일 수익률, KOSPI 대비 초과수익, 당일 등락, 외국인/기관 수급을 종목별 반응성 점수로 반영했다.",
+                f"반응성 분포: {format_counts(reactivity_counts)}",
+                *[
+                    f"상위 후보 {row.get('name')}: 점수 {(row.get('reactivity') or {}).get('score')}점 / {(row.get('reactivity') or {}).get('status')} / 5일 {(row.get('momentum') or {}).get('return_5d_pct')}%"
+                    for row in top_reactivity
+                ],
+                *[
+                    f"하위 후보 {row.get('name')}: 점수 {(row.get('reactivity') or {}).get('score')}점 / {(row.get('reactivity') or {}).get('status')} / 5일 {(row.get('momentum') or {}).get('return_5d_pct')}%"
+                    for row in weak_reactivity
+                ],
                 *[
                     f"{row.get('scenario')}안 {row.get('scenario_name')}: {format_counts(row.get('decision_counts'))}"
                     for row in stock_scenario_summary
@@ -2339,8 +2659,8 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
             "details": [
                 f"최신 수급 데이터 상태는 {live.get('status')}, 원천은 {live.get('source')}이다.",
                 f"보류 판단 종목은 {hold_count}개, 관찰 판단 종목은 {watch_count}개, 소액 검토 종목은 {small_count}개이다.",
-                "외국인 매도가 큰 대형주는 모델 선정 여부와 무관하게 추격매수를 제한했다.",
-                "POSCO홀딩스와 SK텔레콤처럼 가격 변동이 작고 수급 부담이 낮은 종목만 소액/관찰 후보로 남겼다.",
+                "외국인/기관 동시 매도, 지수 대비 약세, 당일 급등락 종목은 모델 선정 여부와 무관하게 우선순위를 낮췄다.",
+                "시장 등급이 3등급 이하일 때는 같은 종목이라도 소액 검토 기준을 더 엄격하게 적용했다.",
                 *[
                     f"{row.get('scenario')}안 검증: {' / '.join(row.get('checks', []))}"
                     for row in validation_scenarios
@@ -2447,19 +2767,27 @@ def write_markdown(report, path):
     live_data = report["stock_strategy"].get("live_data", {})
     if live_data.get("fetched_at"):
         lines.append(f"- 최신가/당일등락/외국인/기관 거래금액 조회시점: {live_data.get('fetched_at')} ({live_data.get('source')})")
+    reactivity_summary = report["stock_strategy"].get("reactivity_summary", {})
+    if reactivity_summary:
+        lines.append(f"- 반응성 로직: {reactivity_summary.get('logic_version')}")
+        lines.append(f"- 반응성 분포: {format_counts(reactivity_summary.get('status_counts', {}))}")
     lines.append("")
-    lines.append("| 코드 | 종목 | 모델군 | 선정일 | 최신가 | 당일등락 | 외국인 | 기관 | 기존판단 | A안 | B안 |")
-    lines.append("|---|---|---|---|---:|---:|---:|---:|---|---|---|")
+    lines.append("| 순위 | 코드 | 종목 | 모델군 | 5일등락 | 지수대비 | 최신가 | 당일등락 | 외국인 | 기관 | 반응성 | 판단 | A안 | B안 |")
+    lines.append("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|")
     for row in report["stock_strategy"]["candidates"]:
         live = row.get("live_quote") or {}
+        momentum = row.get("momentum") or {}
+        reactivity = row.get("reactivity") or {}
         models = row.get("model_display") or " / ".join(row.get("model_display_codes") or row.get("model_ids") or row.get("model_groups", []))
         scenario_map = {item.get("scenario"): item for item in row.get("scenario_decisions", [])}
         a_decision = scenario_map.get("A", {}).get("decision", "-")
         b_decision = scenario_map.get("B", {}).get("decision", "-")
         lines.append(
-            f"| {row['ticker']} | {row['name']} | {models} | {row.get('latest_selection_date')} | "
+            f"| {reactivity.get('rank', '-')} | {row['ticker']} | {row['name']} | {models} | "
+            f"{fmt(momentum.get('return_5d_pct'))}% | {fmt(momentum.get('relative_return_5d_pct'))}%p | "
             f"{fmt(live.get('price'))} | {fmt(live.get('change_pct'))}% | "
-            f"{fmt(live.get('foreign_net_억원'))}억 | {fmt(live.get('institution_net_억원'))}억 | {row['decision']} | "
+            f"{fmt(live.get('foreign_net_억원'))}억 | {fmt(live.get('institution_net_억원'))}억 | "
+            f"{reactivity.get('score', '-')}점/{reactivity.get('status', '-')} | {row['decision']} | "
             f"{a_decision} | {b_decision} |"
         )
     final_strategy = report.get("final_portfolio_strategy", {})
@@ -2638,6 +2966,14 @@ def init_portfolio_schema(con):
     ensure_column(con, "portfolio_runs", "market_effective_asof", "TEXT")
     ensure_column(con, "portfolio_runs", "market_logic_version", "TEXT")
     ensure_column(con, "portfolio_stock_candidates", "scenario_decisions_json", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "base_decision", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "reactivity_rank", "INTEGER")
+    ensure_column(con, "portfolio_stock_candidates", "reactivity_score", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "reactivity_status", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "reactivity_json", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "momentum_json", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "return_5d_pct", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "relative_return_5d_pct", "REAL")
 
 
 def migrate_portfolio_schema(con):
@@ -2943,9 +3279,11 @@ def save_report_to_db(report, json_path, md_path):
                 model_groups, model_ids, model_display_codes, model_display, model_count, selection_close, market_cap,
                 return_from_selection_pct, holding_days, qualitative_summary, live_price,
                 live_change_pct, foreign_net_억원, institution_net_억원,
-                individual_net_억원, pension_net_억원, scenario_decisions_json
+                individual_net_억원, pension_net_억원, scenario_decisions_json,
+                base_decision, reactivity_rank, reactivity_score, reactivity_status,
+                reactivity_json, momentum_json, return_5d_pct, relative_return_5d_pct
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [stock_row(run_id, row) for row in report["stock_strategy"]["candidates"]],
         )
@@ -3049,6 +3387,8 @@ def save_report_to_db(report, json_path, md_path):
 
 def stock_row(run_id, row):
     live = row.get("live_quote") or {}
+    reactivity = row.get("reactivity") or {}
+    momentum = row.get("momentum") or {}
     return (
         run_id,
         row.get("ticker"),
@@ -3073,6 +3413,14 @@ def stock_row(run_id, row):
         live.get("individual_net_억원"),
         live.get("pension_net_억원"),
         json.dumps(row.get("scenario_decisions", []), ensure_ascii=False),
+        row.get("base_decision"),
+        reactivity.get("rank"),
+        reactivity.get("score"),
+        reactivity.get("status"),
+        json.dumps(reactivity, ensure_ascii=False),
+        json.dumps(momentum, ensure_ascii=False),
+        momentum.get("return_5d_pct"),
+        momentum.get("relative_return_5d_pct"),
     )
 
 
