@@ -196,13 +196,18 @@ def stock_model_summary():
     if not STOCK_SELECTION_CSV.exists():
         return []
     rows = list(csv.DictReader(STOCK_SELECTION_CSV.open("r", encoding="utf-8-sig", newline="")))
-    out = []
-    for code, meta in TARGET_STOCKS.items():
-        selected = [row for row in rows if row["종목코드"].zfill(6) == code]
-        if not selected:
+    if not rows:
+        return []
+    latest = max(row["선정일"] for row in rows)
+    by_ticker = {}
+    for row in rows:
+        if row["선정일"] != latest:
             continue
-        latest = max(row["선정일"] for row in selected)
-        latest_rows = [row for row in selected if row["선정일"] == latest]
+        code = row["종목코드"].zfill(6)
+        by_ticker.setdefault(code, []).append(row)
+    out = []
+    for code, latest_rows in sorted(by_ticker.items()):
+        meta = TARGET_STOCKS.get(code, {})
         model_groups = sorted({row["전략군"] for row in latest_rows})
         model_ids = sorted({row["모델"] for row in latest_rows})
         model_display_codes = [MODEL_DISPLAY_MAP.get(model_id, model_id) for model_id in model_ids]
@@ -210,9 +215,9 @@ def stock_model_summary():
         out.append(
             {
                 "ticker": code,
-                "name": meta["name"],
-                "group": meta["group"],
-                "decision": meta["decision"],
+                "name": meta.get("name") or first_row.get("종목명"),
+                "group": meta.get("group") or "weekly_quant_candidate",
+                "decision": meta.get("decision") or "관찰",
                 "latest_selection_date": latest,
                 "model_groups": model_groups,
                 "model_ids": model_ids,
@@ -1702,6 +1707,25 @@ def apply_candidate_reactivity(live, market_risk, asof_date):
     return updated
 
 
+def select_top_reactive_candidates(live, limit=10):
+    updated = dict(live)
+    universe_items = live.get("items", [])
+    selected = sorted(
+        universe_items,
+        key=lambda row: row.get("reactivity", {}).get("score", 0),
+        reverse=True,
+    )[:limit]
+    updated["items"] = selected
+    updated["candidate_universe"] = live.get("candidate_universe") or {
+        "selection_rule": "전체 Quant 주간 후보를 시장등급으로 제외하지 않고 일간 반응성 점수 상위 10개 선정",
+        "universe_count": len(universe_items),
+        "selected_count": len(selected),
+        "selection_limit": limit,
+    }
+    updated["candidate_universe"]["selected_count"] = len(selected)
+    return updated
+
+
 def build_candidate_scenario_decisions(row, scenarios):
     live_quote = row.get("live_quote") or {}
     flow_state, net_flow = candidate_flow_state(live_quote)
@@ -2050,7 +2074,6 @@ def build_report(asof_date):
     e_policy = read_json(E_SERIES_POLICY)
     s6 = load_s6_holdings()
     stocks = stock_model_summary()
-    live = attach_live_snapshot(stocks, asof_date)
     historical_snapshot = load_historical_portfolio_snapshot(asof_date)
     market_risk = (
         refresh_market_risk_rating(historical_snapshot.get("market_risk", {}))
@@ -2060,7 +2083,18 @@ def build_report(asof_date):
     market_context_for_report = historical_snapshot.get("market_news_context", {}) if historical_snapshot else market_context
     market_risk = apply_step1_v2_assessment(market_risk, asof_date, market_context_for_report)
     portfolio_scenarios = build_step2_portfolio_scenarios(market_risk)
-    live = apply_candidate_reactivity(live, market_risk, asof_date)
+    universe_live = attach_backup_live_snapshot(stocks, asof_date, "universe_scoring")
+    universe_live = apply_candidate_reactivity(universe_live, market_risk, asof_date)
+    live = select_top_reactive_candidates(universe_live, 10)
+    selected_live = attach_live_snapshot(live["items"], asof_date)
+    selected_live = apply_candidate_reactivity(selected_live, market_risk, asof_date)
+    live = select_top_reactive_candidates(
+        {
+            **selected_live,
+            "candidate_universe": live.get("candidate_universe"),
+        },
+        10,
+    )
     live = apply_candidate_scenario_decisions(live, portfolio_scenarios)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
@@ -2103,6 +2137,7 @@ def build_report(asof_date):
         "stock_strategy": {
             "exposure_guidance": build_stock_exposure_guidance(market_risk),
             "execution_rule": "외국인 매도와 당일 급락/급등 종목은 추격 금지. 기관/외국인 수급이 동시 개선되는 종목만 후보 유지.",
+            "candidate_universe": live.get("candidate_universe"),
             "reactivity_summary": build_stock_reactivity_summary(live["items"]),
             "scenario_summary": build_stock_scenario_summary(live["items"], portfolio_scenarios),
             "validation_scenarios": build_step5_validation_scenarios(portfolio_scenarios),
@@ -2121,7 +2156,7 @@ def build_report(asof_date):
             {"step": 1, "name": "시장 위험 판단", "result": market_rating_text(market_risk)},
             {"step": 2, "name": "ETF 전략 선택", "result": build_final_process_result(market_risk)},
             {"step": 3, "name": "E-series ETF 참고", "result": "shadow/admin reference, 공개 추천 제외"},
-            {"step": 4, "name": "주식 모델 후보 점검", "result": "종목별 반응성 점수로 일간 재정렬"},
+            {"step": 4, "name": "주식 모델 후보 점검", "result": "전체 후보 중 반응성 상위 10개 선정"},
             {"step": 5, "name": "정성 분석과 최신 수급 확인", "result": "Kiwoom 수급과 최근 상대강도로 실행상태 재분류"},
             {"step": 6, "name": "최종 포트폴리오 판단", "result": build_final_process_result(market_risk)},
         ],
@@ -2641,9 +2676,10 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
         {
             "step": 4,
             "title": "주식 모델 후보 점검",
-            "summary": "주식은 모델 후보를 그대로 두지 않고 최근 5거래일 상대강도와 수급으로 매일 우선순위를 재정렬한다.",
+            "summary": "주식은 전체 Quant 주간 후보를 열어두고 최근 5거래일 상대강도와 수급으로 매일 상위 10개를 재선정한다.",
             "details": [
-                "S2/S3/T/I 계열 중복 선정 종목을 우선 점검했다.",
+                f"전체 후보 {live.get('candidate_universe', {}).get('universe_count')}개 중 반응성 점수 상위 {live.get('candidate_universe', {}).get('selected_count')}개를 공식 후보로 선정했다.",
+                "시장등급은 후보 모델을 제외하는 데 쓰지 않고 주식 총비중과 종목당 비중을 조절하는 데만 사용했다.",
                 "최근 5거래일 수익률, KOSPI 대비 초과수익, 당일 등락, 외국인/기관 수급을 종목별 반응성 점수로 반영했다.",
                 f"반응성 분포: {format_counts(reactivity_counts)}",
                 *[
@@ -2773,6 +2809,13 @@ def write_markdown(report, path):
     lines.append("")
     lines.append("## 주식 후보")
     lines.append(report["stock_strategy"]["exposure_guidance"])
+    candidate_universe = report["stock_strategy"].get("candidate_universe") or {}
+    if candidate_universe:
+        lines.append(
+            f"- 후보 선정: 전체 Quant 주간 후보 {candidate_universe.get('universe_count')}개 중 "
+            f"반응성 점수 상위 {candidate_universe.get('selected_count')}개"
+        )
+        lines.append("- 시장등급은 종목 제외가 아니라 주식/ETF/현금 비중 조절에만 적용")
     live_data = report["stock_strategy"].get("live_data", {})
     if live_data.get("fetched_at"):
         lines.append(f"- 최신가/당일등락/외국인/기관 거래금액 조회시점: {live_data.get('fetched_at')} ({live_data.get('source')})")
