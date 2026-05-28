@@ -1284,7 +1284,7 @@ def build_market_action(market_risk):
 def build_etf_strategy_reason(market_risk):
     grade = market_grade(market_risk)
     if grade is not None and (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "STEP1이 등급 경계 구간이므로 S6 방어 배분을 기본안으로 두고, 수급 개선 시 조건부 주식 편입안을 함께 제시한다."
+        return "STEP1이 등급 경계 구간이므로 S6 방어 배분을 유지하고, 주식 비중은 포트폴리오 전체에서 제한적으로 조절한다."
     if grade is not None and grade <= 2:
         return "시장 위험 신호가 높아 위험자산 노출을 낮추는 S6 방어형 ETF 모델을 우선 적용한다."
     if grade is not None and grade == 3:
@@ -1300,7 +1300,7 @@ def build_etf_strategy_reason(market_risk):
 def build_market_step_summary(market_risk):
     step1 = market_risk.get("step1_v2") or {}
     if step1.get("is_boundary"):
-        return f"시장판단은 {market_rating_text(market_risk)}이다. 등급 경계 구간이므로 보수안과 조건부 공격안을 함께 검토한다."
+        return f"시장판단은 {market_rating_text(market_risk)}이다. 등급 경계 구간이므로 종목은 유지하고 비중만 보수적으로 조절한다."
     grade = market_grade(market_risk)
     if grade is not None and grade <= 2:
         return "시장 위험 신호가 높아 방어적 판단을 우선했다."
@@ -1314,9 +1314,7 @@ def build_market_step_summary(market_risk):
 def build_market_step_conclusion(market_risk):
     step1 = market_risk.get("step1_v2") or {}
     if step1.get("is_boundary"):
-        adjacent = step1.get("adjacent_grade")
-        adjacent_label = STEP1_GRADE_LABELS.get(adjacent)
-        return f"기본은 {market_rating_text(market_risk)} 기준 보수안이며, 수급 개선 시 {adjacent}등급 {adjacent_label} 기준 조건부 포트폴리오로 전환한다."
+        return f"기준은 {market_rating_text(market_risk)}이며, 수급 개선 여부는 종목 교체가 아니라 주식 비중 조절에 반영한다."
     grade = market_grade(market_risk)
     if grade is not None and grade <= 2:
         return "오늘은 공격적 주식 매수보다 방어형 자산과 현금성 자산을 우선한다."
@@ -1330,7 +1328,7 @@ def build_market_step_conclusion(market_risk):
 def build_etf_step_summary(market_risk):
     step1 = market_risk.get("step1_v2") or {}
     if step1.get("is_boundary"):
-        return "STEP1이 경계 구간이므로 S6 중심 보수안과 주식 일부 편입 조건부안을 동시에 제시했다."
+        return "STEP1이 경계 구간이므로 S6를 방어축으로 유지하고 주식 비중은 제한적으로 조절했다."
     grade = market_grade(market_risk)
     if grade is not None and grade <= 2:
         return "시장 위험이 높은 구간이므로 위험자산 편입을 줄이고 방어형 ETF 모델인 S6를 우선 적용했다."
@@ -1344,7 +1342,7 @@ def build_etf_step_summary(market_risk):
 def build_etf_step_conclusion(market_risk):
     step1 = market_risk.get("step1_v2") or {}
     if step1.get("is_boundary"):
-        return "S6를 기본축으로 유지하되 수급 개선 여부에 따라 주식 편입안을 병행 검토한다."
+        return "S6를 기본축으로 유지하되 수급 개선 여부는 전체 주식 비중 조절에 반영한다."
     grade = market_grade(market_risk)
     if grade is not None and grade <= 2:
         return "포트폴리오의 중심은 S6 방어 배분으로 두는 것이 합리적이다."
@@ -1357,7 +1355,7 @@ def build_etf_step_conclusion(market_risk):
 
 def build_final_step_summary(market_risk):
     if (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "시장 방향성과 확산력은 우호적이나 수급과 리스크가 엇갈려 보수안과 조건부 공격안을 함께 제시하는 것이 결론이다."
+        return "시장 방향성과 확산력은 우호적이나 수급과 리스크가 엇갈려 종목은 유지하고 주식 비중만 제한적으로 조절하는 것이 결론이다."
     if is_constructive_watch(market_risk):
         return "시장 강도는 우호적이지만 ETF 모델, 주식 후보, 수급 확인을 종합하면 단계적 주식 편입과 S6 기준 배분 병행이 결론이다."
     if is_neutral_grade(market_risk):
@@ -1367,7 +1365,7 @@ def build_final_step_summary(market_risk):
 
 def build_final_step_conclusion(market_risk):
     if (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "최종 결론은 보수안을 기본 포트폴리오로 채택하고, 외국인/프로그램 수급 개선 시 조건부 공격안으로 전환하는 것이다."
+        return "최종 결론은 상위 10개 종목을 유지하되, 시장등급에 따라 주식/ETF/현금 비중만 조절하는 것이다."
     if is_constructive_watch(market_risk):
         return "최종 결론은 S6 기준 배분을 유지하되, 주식은 수급 개선 종목부터 단계적 편입을 검토하는 것이다."
     if is_neutral_grade(market_risk):
@@ -1377,163 +1375,73 @@ def build_final_step_conclusion(market_risk):
 
 def build_step6_first_detail(market_risk):
     if (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "ETF는 S6 기준 배분을 기본안으로 두고, 주식은 조건부 편입안으로 별도 관리한다."
+        return "ETF는 S6 기준 배분을 유지하고, 주식은 별도 안이 아니라 전체 비중 정책으로 관리한다."
     if is_constructive_watch(market_risk):
         return "ETF는 S6 기준 배분을 유지하되, 주식 편입 가능성을 함께 검토한다."
     return "ETF는 S6 방어 배분을 중심으로 한다."
 
 
 def build_stock_exposure_guidance(market_risk):
-    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "기본안은 주식 10~20% 이내 제한, 조건부안은 수급 개선 확인 시 20~35%까지 단계적 편입 검토."
-    if is_constructive_watch(market_risk):
-        return "오늘 주식 비중은 0% 고정이 아니라 수급이 확인되는 종목부터 단계적 편입을 검토."
-    if is_neutral_grade(market_risk):
-        return "오늘 주식 비중은 0% 고정이 아니라 최대 10~20% 이내 관찰/소액 분할 검토."
-    return "오늘 주식 신규 편입은 제한하고 방어 배분을 우선."
+    policy = build_portfolio_weight_policy(market_risk)
+    return f"주식 후보는 상위 10개를 유지하고, 실행 비중은 포트폴리오 전체 주식 {policy['stock_weight_range_pct']}% 범위에서 조절한다."
 
 
 def build_final_process_result(market_risk):
-    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "보수안 기본 + 조건부 공격안 병행"
     if is_constructive_watch(market_risk):
-        return "S6 기준 배분 유지 + 주식 단계적 편입 검토"
+        return "S6 기준 배분 유지 + 주식 비중 확대 가능"
     if is_neutral_grade(market_risk):
         return "S6 기준 배분 유지, 주식은 제한 비중"
     return "ETF 방어 배분 중심, 주식은 제한 비중"
 
 
 def build_stock_candidate_step_conclusion(market_risk):
-    if (market_risk.get("step1_v2") or {}).get("is_boundary"):
-        return "주식 후보는 유지하되 기본안에서는 제한 비중, 조건부안에서는 수급 개선 종목부터 단계적 편입한다."
     if is_constructive_watch(market_risk):
-        return "주식 후보는 유지하고, 수급과 가격 조건이 개선되는 종목부터 단계적 편입을 검토한다."
+        return "주식 후보 상위 10개는 유지하고, 포트폴리오 전체 주식 비중만 시장등급에 맞춰 조절한다."
     if is_neutral_grade(market_risk):
-        return "주식 후보는 유지하되 오늘 전체 주식 비중은 최대 10~20% 이내로 제한한다."
-    return "주식 후보는 유지하되 신규 편입은 제한하고 관찰 중심으로 관리한다."
+        return "주식 후보 상위 10개는 유지하되 전체 주식 비중은 제한한다."
+    return "주식 후보 상위 10개는 유지하되 전체 주식 비중은 방어적으로 제한한다."
+
+
+def build_portfolio_weight_policy(market_risk):
+    step1 = market_risk.get("step1_v2") or {}
+    grade = step1.get("grade") or market_grade(market_risk)
+    if grade and grade <= 2:
+        stock_range = "0~10"
+        etf_policy = "S6_DEFENSIVE_V1 방어 배분 우선"
+        cash_policy = "현금성/방어 ETF 최대화"
+    elif grade == 3:
+        stock_range = "0~15"
+        etf_policy = "S6_DEFENSIVE_V1 중심"
+        cash_policy = "현금성/방어 ETF 높게 유지"
+    elif grade == 5:
+        stock_range = "20~40"
+        etf_policy = "S6 기준 배분 유지"
+        cash_policy = "현금성/방어 ETF 중립 이하"
+    elif grade == 6:
+        stock_range = "35~60"
+        etf_policy = "방어 ETF 비중 축소 가능"
+        cash_policy = "현금성/방어 ETF 낮게 유지"
+    else:
+        stock_range = "10~20"
+        etf_policy = "S6_DEFENSIVE_V1 기준 배분 유지"
+        cash_policy = "현금성/방어 ETF 중립 이상"
+    return {
+        "logic_version": "portfolio_weight_policy_v1_20260528",
+        "basis": f"{grade}등급 {STEP1_GRADE_LABELS.get(grade)}" if grade else market_rating_text(market_risk),
+        "stock_selection_policy": "시장등급과 무관하게 전체 Quant 후보 중 일간 반응성 점수 상위 10개 유지",
+        "stock_weight_range_pct": stock_range,
+        "etf_policy": etf_policy,
+        "cash_or_defensive_policy": cash_policy,
+        "adjustment_rule": "시장등급은 종목 제외가 아니라 주식/ETF/현금 비중 조절에만 사용",
+    }
 
 
 def build_step2_portfolio_scenarios(market_risk):
-    step1 = market_risk.get("step1_v2") or {}
-    grade = step1.get("grade") or market_grade(market_risk)
-    scenarios = []
-    if step1.get("is_boundary") and grade == 4 and step1.get("adjacent_grade") == 5:
-        scenarios.append(
-            {
-                "scenario": "A",
-                "name": "보수안",
-                "basis": "4등급 중립 상단",
-                "etf_policy": "S6_DEFENSIVE_V1 중심 유지",
-                "stock_policy": "주식 후보는 관찰/소액분할 중심",
-                "stock_weight_range_pct": "10~20",
-                "cash_or_defensive_weight": "높게 유지",
-                "activation_condition": "기본 적용",
-            }
-        )
-        scenarios.append(
-            {
-                "scenario": "B",
-                "name": "조건부 공격안",
-                "basis": "5등급 우호적 관찰 하단",
-                "etf_policy": "S6 유지 + 성장/모멘텀 노출 일부 허용",
-                "stock_policy": "수급 개선 종목부터 단계적 편입",
-                "stock_weight_range_pct": "20~35",
-                "cash_or_defensive_weight": "일부 축소",
-                "activation_condition": "외국인/프로그램 매도 완화 또는 기관·외국인 동시 개선 확인",
-            }
-        )
-        return scenarios
-    if grade and grade <= 2:
-        return [
-            {
-                "scenario": "A",
-                "name": "방어안",
-                "basis": f"{grade}등급 {STEP1_GRADE_LABELS.get(grade)}",
-                "etf_policy": "S6_DEFENSIVE_V1 방어 배분 우선",
-                "stock_policy": "신규 주식 편입 제한",
-                "stock_weight_range_pct": "0~10",
-                "cash_or_defensive_weight": "최대화",
-                "activation_condition": "기본 적용",
-            }
-        ]
-    if grade == 3:
-        return [
-            {
-                "scenario": "A",
-                "name": "주의 관찰안",
-                "basis": "3등급 주의 관찰",
-                "etf_policy": "S6_DEFENSIVE_V1 중심",
-                "stock_policy": "관찰 중심, 소액 편입만 예외 허용",
-                "stock_weight_range_pct": "0~15",
-                "cash_or_defensive_weight": "높게 유지",
-                "activation_condition": "기본 적용",
-            }
-        ]
-    if grade == 5:
-        return [
-            {
-                "scenario": "A",
-                "name": "우호적 관찰안",
-                "basis": "5등급 우호적 관찰",
-                "etf_policy": "S6 기준 배분 유지",
-                "stock_policy": "수급과 가격 안정 종목부터 단계적 편입",
-                "stock_weight_range_pct": "20~40",
-                "cash_or_defensive_weight": "중립 이하로 축소",
-                "activation_condition": "기본 적용",
-            }
-        ]
-    if grade == 6:
-        return [
-            {
-                "scenario": "A",
-                "name": "적극 위험선호안",
-                "basis": "6등급 적극 위험선호",
-                "etf_policy": "방어 ETF 비중 축소",
-                "stock_policy": "주식 전략 모델 비중 확대",
-                "stock_weight_range_pct": "35~60",
-                "cash_or_defensive_weight": "낮게 유지",
-                "activation_condition": "과열/수급 훼손이 없을 때 적용",
-            }
-        ]
-    return [
-        {
-            "scenario": "A",
-            "name": "중립안",
-            "basis": "4등급 중립",
-            "etf_policy": "S6_DEFENSIVE_V1 기준 배분 유지",
-            "stock_policy": "주식 후보 관찰/소액분할 검토",
-            "stock_weight_range_pct": "10~20",
-            "cash_or_defensive_weight": "중립 이상 유지",
-            "activation_condition": "기본 적용",
-        }
-    ]
+    return []
 
 
 def build_step3_etf_scenario_reference(scenarios, e_policy):
-    out = []
-    e_code = e_policy.get("strategy_model_code")
-    e_date = e_policy.get("as_of_date")
-    for scenario in scenarios:
-        code = scenario.get("scenario")
-        if code == "A":
-            interpretation = "E-series는 S6 방어 배분을 대체하지 않고 ETF 전략 참고 신호로만 사용한다."
-            usage = "보수안에서는 S6를 우선하고 E-series는 편입 확대 근거로 쓰지 않는다."
-        else:
-            interpretation = "E-series 신호가 성장/모멘텀 ETF와 같은 방향일 때 조건부 공격안의 보조 근거로 사용한다."
-            usage = "조건부 공격안에서는 E-series가 위험선호 회복을 확인할 때 ETF 노출 조정 참고자료로 쓴다."
-        out.append(
-            {
-                "scenario": code,
-                "scenario_name": scenario.get("name"),
-                "basis": scenario.get("basis"),
-                "e_series_model": e_code,
-                "e_series_as_of_date": e_date,
-                "interpretation": interpretation,
-                "usage": usage,
-                "public_recommendation_allowed": e_policy.get("governance", {}).get("public_recommendation_allowed"),
-            }
-        )
-    return out
+    return []
 
 
 def candidate_flow_state(live_quote):
@@ -1758,69 +1666,7 @@ def apply_portfolio_selection_fields(live, asof_date):
 
 
 def build_candidate_scenario_decisions(row, scenarios):
-    live_quote = row.get("live_quote") or {}
-    flow_state, net_flow = candidate_flow_state(live_quote)
-    price_state = candidate_price_state(live_quote)
-    is_core = row.get("group") == "core_candidate"
-    model_count = row.get("model_count") or 0
-    reactivity = row.get("reactivity") or {}
-    reactivity_status = reactivity.get("status")
-    out = []
-    for scenario in scenarios:
-        code = scenario.get("scenario")
-        if code == "A":
-            if reactivity_status in {"제외 대기", "우선순위 하락"}:
-                decision = reactivity_status
-                weight = "0%"
-                condition = "종목 반응성 회복 전까지 편입 제외"
-            elif "소액" in row.get("decision", "") and price_state in {"stable", "unknown"}:
-                decision = "소액/관찰"
-                weight = "1~3%"
-                condition = "기본안 내 제한 편입 가능"
-            elif is_core and flow_state in {"positive", "mixed_positive"} and price_state != "overheated":
-                decision = "관찰/소액후보"
-                weight = "0~2%"
-                condition = "가격 안정 유지 시 소액 검토"
-            else:
-                decision = "보류/관찰"
-                weight = "0%"
-                condition = "수급과 가격 안정 재확인"
-        else:
-            if reactivity_status in {"제외 대기", "우선순위 하락"}:
-                decision = reactivity_status
-                weight = "0%"
-                condition = "최근 상대강도 또는 수급 회복 필요"
-            elif is_core and model_count >= 2 and flow_state in {"positive", "mixed_positive"} and price_state != "overheated":
-                decision = "단계적 편입검토"
-                weight = "2~5%"
-                condition = "외국인/기관 수급 개선 유지"
-            elif is_core and price_state != "overheated":
-                decision = "조건부 소액검토"
-                weight = "1~3%"
-                condition = "외국인 매도 완화 또는 기관 매수 지속"
-            elif model_count >= 2 and price_state == "stable" and flow_state != "negative":
-                decision = "조건부 관찰"
-                weight = "0~2%"
-                condition = "급등 없이 수급 개선 확인"
-            else:
-                decision = "추격 보류"
-                weight = "0%"
-                condition = "가격 과열/수급 부담 해소 필요"
-        reason = (
-            f"모델 {model_count}개, 수급상태 {flow_state}, 순수급 {fmt(net_flow)}억원, "
-            f"가격상태 {price_state}, 반응성 {reactivity.get('score')}점/{reactivity_status}"
-        )
-        out.append(
-            {
-                "scenario": code,
-                "scenario_name": scenario.get("name"),
-                "decision": decision,
-                "max_weight_hint": weight,
-                "activation_condition": condition,
-                "reason": reason,
-            }
-        )
-    return out
+    return []
 
 
 def apply_candidate_scenario_decisions(live, scenarios):
@@ -1835,28 +1681,7 @@ def apply_candidate_scenario_decisions(live, scenarios):
 
 
 def build_stock_scenario_summary(candidates, scenarios):
-    out = []
-    for scenario in scenarios:
-        code = scenario.get("scenario")
-        counts = Counter()
-        for row in candidates:
-            for decision in row.get("scenario_decisions", []):
-                if decision.get("scenario") == code:
-                    counts.update([decision.get("decision")])
-        out.append(
-            {
-                "scenario": code,
-                "scenario_name": scenario.get("name"),
-                "basis": scenario.get("basis"),
-                "decision_counts": dict(counts),
-                "interpretation": (
-                    "보수안은 후보 유지와 제한 비중 관리가 핵심이다."
-                    if code == "A"
-                    else "조건부 공격안은 수급 개선 종목부터 단계적으로 편입한다."
-                ),
-            }
-        )
-    return out
+    return []
 
 
 def build_stock_reactivity_summary(candidates):
@@ -1899,46 +1724,18 @@ def build_stock_reactivity_summary(candidates):
 
 
 def build_step5_validation_scenarios(scenarios):
-    out = []
-    for scenario in scenarios:
-        if scenario.get("scenario") == "A":
-            checks = [
-                "외국인/프로그램 매도가 지속되면 신규 편입을 보류한다.",
-                "급등 종목은 추격하지 않고 가격 안정 후 재점검한다.",
-                "소액 후보도 종목별 손실 제한 기준을 둔다.",
-            ]
-        else:
-            checks = [
-                "외국인 매도 완화 또는 기관·외국인 동시 개선을 확인한다.",
-                "KOSDAQ 강세가 후보 종목 수급으로 확산되는지 확인한다.",
-                "환율과 금리 부담이 완화될 때만 주식 비중을 늘린다.",
-            ]
-        out.append(
-            {
-                "scenario": scenario.get("scenario"),
-                "scenario_name": scenario.get("name"),
-                "checks": checks,
-            }
-        )
-    return out
+    return []
 
 
-def build_final_portfolio_strategy(market_risk, scenarios):
+def build_final_portfolio_strategy(market_risk, weight_policy):
     step1 = market_risk.get("step1_v2") or {}
-    default = scenarios[0] if scenarios else {}
-    conditional = scenarios[1] if len(scenarios) > 1 else None
-    transition_conditions = [
-        "외국인/프로그램 매도 완화",
-        "기관 매수 유지 또는 외국인·기관 동시 개선",
-        "후보 종목의 가격 과열 완화",
-        "환율/금리 리스크 완화",
-    ]
     return {
         "step1_rating": market_rating_text(market_risk),
         "step1_score": step1.get("score"),
-        "default_scenario": default,
-        "conditional_scenario": conditional,
-        "transition_conditions": transition_conditions if conditional else [],
+        "weight_policy": weight_policy,
+        "stock_weight_range_pct": weight_policy.get("stock_weight_range_pct"),
+        "etf_policy": weight_policy.get("etf_policy"),
+        "cash_or_defensive_policy": weight_policy.get("cash_or_defensive_policy"),
         "conclusion": build_final_step_conclusion(market_risk),
     }
 
@@ -2113,7 +1910,7 @@ def build_report(asof_date):
     )
     market_context_for_report = historical_snapshot.get("market_news_context", {}) if historical_snapshot else market_context
     market_risk = apply_step1_v2_assessment(market_risk, asof_date, market_context_for_report)
-    portfolio_scenarios = build_step2_portfolio_scenarios(market_risk)
+    weight_policy = build_portfolio_weight_policy(market_risk)
     universe_live = attach_backup_live_snapshot(stocks, asof_date, "universe_scoring")
     universe_live = apply_candidate_reactivity(universe_live, market_risk, asof_date)
     live = select_top_reactive_candidates(universe_live, 10)
@@ -2127,7 +1924,6 @@ def build_report(asof_date):
         10,
     )
     live = apply_portfolio_selection_fields(live, asof_date)
-    live = apply_candidate_scenario_decisions(live, portfolio_scenarios)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
     model_concentration = build_model_concentration_explanation(
@@ -2154,8 +1950,9 @@ def build_report(asof_date):
         "etf_strategy": {
             "selected_model": "S6_DEFENSIVE_V1",
             "reason": build_etf_strategy_reason(market_risk),
-            "portfolio_scenarios": portfolio_scenarios,
-            "e_series_scenario_reference": build_step3_etf_scenario_reference(portfolio_scenarios, e_policy),
+            "portfolio_weight_policy": weight_policy,
+            "portfolio_scenarios": [],
+            "e_series_scenario_reference": [],
             "s6_allocation": s6,
             "e_series_reference": {
                 "as_of_date": e_policy.get("as_of_date"),
@@ -2171,8 +1968,8 @@ def build_report(asof_date):
             "execution_rule": "외국인 매도와 당일 급락/급등 종목은 추격 금지. 기관/외국인 수급이 동시 개선되는 종목만 후보 유지.",
             "candidate_universe": live.get("candidate_universe"),
             "reactivity_summary": build_stock_reactivity_summary(live["items"]),
-            "scenario_summary": build_stock_scenario_summary(live["items"], portfolio_scenarios),
-            "validation_scenarios": build_step5_validation_scenarios(portfolio_scenarios),
+            "scenario_summary": [],
+            "validation_scenarios": [],
             "live_data": {
                 "status": live.get("status"),
                 "source": live.get("source"),
@@ -2193,7 +1990,7 @@ def build_report(asof_date):
             {"step": 6, "name": "최종 포트폴리오 판단", "result": build_final_process_result(market_risk)},
         ],
         "step_details": step_details,
-        "final_portfolio_strategy": build_final_portfolio_strategy(market_risk, portfolio_scenarios),
+        "final_portfolio_strategy": build_final_portfolio_strategy(market_risk, weight_policy),
         "model_concentration_explanation": model_concentration,
         "disclaimer": "본 자료는 Quant 모델 기반 투자정보 정리이며 매수/매도 권유가 아니다.",
     }
@@ -2628,11 +2425,8 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
     breadth = market_risk.get("breadth", [])
     flows = market_risk.get("flows", [])
     step1 = market_risk.get("step1_v2") or {}
-    scenarios = build_step2_portfolio_scenarios(market_risk)
-    e_scenario_refs = build_step3_etf_scenario_reference(scenarios, e_policy)
-    stock_scenario_summary = build_stock_scenario_summary(live.get("items", []), scenarios)
-    validation_scenarios = build_step5_validation_scenarios(scenarios)
-    final_strategy = build_final_portfolio_strategy(market_risk, scenarios)
+    weight_policy = build_portfolio_weight_policy(market_risk)
+    final_strategy = build_final_portfolio_strategy(market_risk, weight_policy)
     axis_text = []
     for axis in step1.get("axes", []):
         axis_text.append(f"{axis.get('axis')}: {axis.get('score')}/{axis.get('max_score')}점")
@@ -2681,10 +2475,9 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
             "details": [
                 f"S6 최신 리밸런싱 기준일은 {s6.get('rebalance_date')}이다.",
                 f"현금성/단기채 성격 비중은 약 {round(cash_like, 1)}%, 달러/금/인버스/장기채 방어 비중은 약 {round(hedge_like, 1)}%이다.",
-                *[
-                    f"{row.get('scenario')}안 {row.get('name')}: {row.get('basis')} / 주식 {row.get('stock_weight_range_pct')}% / {row.get('activation_condition')}"
-                    for row in build_step2_portfolio_scenarios(market_risk)
-                ],
+                f"주식 비중 정책: {weight_policy.get('stock_weight_range_pct')}%",
+                f"ETF 정책: {weight_policy.get('etf_policy')}",
+                f"현금/방어 정책: {weight_policy.get('cash_or_defensive_policy')}",
                 "구성은 단기금리, 달러채권, 금, 인버스, 장기채, 현금으로 분산되어 있다.",
             ],
             "conclusion": build_etf_step_conclusion(market_risk),
@@ -2697,13 +2490,9 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 f"E-series 기준일은 {e_policy.get('as_of_date')}이다.",
                 f"운영 후보 정책은 {e_policy.get('active_primary_shadow_policy')}이다.",
                 f"공개 추천 허용 여부는 {e_policy.get('governance', {}).get('public_recommendation_allowed')}이다.",
-                *[
-                    f"{row.get('scenario')}안 {row.get('scenario_name')}: {row.get('usage')}"
-                    for row in e_scenario_refs
-                ],
                 "따라서 S6 실행 판단을 대체하지 않고 ETF 전략 검증 참고자료로만 사용한다.",
             ],
-            "conclusion": "E-series는 A안에서는 방어 유지 확인용, B안에서는 ETF 노출 확대 보조 확인용으로 분리해 사용한다.",
+            "conclusion": "E-series는 공개 추천이 아니라 ETF 전략 검증 참고자료로만 사용한다.",
         },
         {
             "step": 4,
@@ -2722,10 +2511,6 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                     f"하위 후보 {row.get('name')}: 점수 {(row.get('reactivity') or {}).get('score')}점 / {(row.get('reactivity') or {}).get('status')} / 5일 {(row.get('momentum') or {}).get('return_5d_pct')}%"
                     for row in weak_reactivity
                 ],
-                *[
-                    f"{row.get('scenario')}안 {row.get('scenario_name')}: {format_counts(row.get('decision_counts'))}"
-                    for row in stock_scenario_summary
-                ],
             ],
             "conclusion": build_stock_candidate_step_conclusion(market_risk),
         },
@@ -2738,12 +2523,9 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 f"보류 판단 종목은 {hold_count}개, 관찰 판단 종목은 {watch_count}개, 소액 검토 종목은 {small_count}개이다.",
                 "외국인/기관 동시 매도, 지수 대비 약세, 당일 급등락 종목은 모델 선정 여부와 무관하게 우선순위를 낮췄다.",
                 "시장 등급이 3등급 이하일 때는 같은 종목이라도 소액 검토 기준을 더 엄격하게 적용했다.",
-                *[
-                    f"{row.get('scenario')}안 검증: {' / '.join(row.get('checks', []))}"
-                    for row in validation_scenarios
-                ],
+                "종목 선정은 상위 10개로 고정하고, 시장 위험은 편입 비중과 현금/ETF 배분에서 반영한다.",
             ],
-            "conclusion": "정성적으로 좋아도 A안/B안별 수급, 가격, 리스크 조건을 통과해야 실행 후보로 남긴다.",
+            "conclusion": "정성적으로 좋아도 급등·수급 훼손 종목은 비중 배정에서 보수적으로 처리한다.",
         },
         {
             "step": 6,
@@ -2754,14 +2536,9 @@ def build_step_details(market_risk, market_context, s6, e_policy, live):
                 "주식은 0% 고정은 아니지만 신규 편입은 제한적으로만 검토한다.",
                 "추격매수 보류 종목은 관심 목록에 남기되 매수 실행 종목으로 표시하지 않는다.",
                 "시장 확산력과 외국인 수급이 개선되면 주식 비중 확대 여부를 다시 판단한다.",
-                f"기본안은 {final_strategy.get('default_scenario', {}).get('name')}이며 주식 비중은 {final_strategy.get('default_scenario', {}).get('stock_weight_range_pct')}% 범위다.",
-                *(
-                    [
-                        f"조건부안은 {final_strategy.get('conditional_scenario', {}).get('name')}이며 전환조건은 {' / '.join(final_strategy.get('transition_conditions', []))}이다."
-                    ]
-                    if final_strategy.get("conditional_scenario")
-                    else []
-                ),
+                f"주식 비중은 {final_strategy.get('stock_weight_range_pct')}% 범위다.",
+                f"ETF 정책은 {final_strategy.get('etf_policy')}이다.",
+                f"현금/방어 정책은 {final_strategy.get('cash_or_defensive_policy')}이다.",
             ],
             "conclusion": build_final_step_conclusion(market_risk),
         },
@@ -2826,13 +2603,11 @@ def write_markdown(report, path):
     lines.append("## ETF 전략")
     lines.append(f"- 선택 모델: {report['etf_strategy']['selected_model']}")
     lines.append(f"- 판단: {report['etf_strategy']['reason']}")
-    for scenario in report["etf_strategy"].get("portfolio_scenarios", []):
-        lines.append(
-            f"- {scenario.get('scenario')}안 {scenario.get('name')}: {scenario.get('basis')}, "
-            f"주식 {scenario.get('stock_weight_range_pct')}%, {scenario.get('activation_condition')}"
-        )
-    for ref in report["etf_strategy"].get("e_series_scenario_reference", []):
-        lines.append(f"- E-series {ref.get('scenario')}안 적용: {ref.get('usage')}")
+    weight_policy = report["etf_strategy"].get("portfolio_weight_policy", {})
+    if weight_policy:
+        lines.append(f"- 주식 비중 정책: {weight_policy.get('stock_weight_range_pct')}%")
+        lines.append(f"- ETF 정책: {weight_policy.get('etf_policy')}")
+        lines.append(f"- 현금/방어 정책: {weight_policy.get('cash_or_defensive_policy')}")
     lines.append("")
     lines.append("| 코드 | 종목 | 역할 | 비중 |")
     lines.append("|---|---:|---:|---:|".replace("---:", "---"))
@@ -2856,34 +2631,27 @@ def write_markdown(report, path):
         lines.append(f"- 반응성 로직: {reactivity_summary.get('logic_version')}")
         lines.append(f"- 반응성 분포: {format_counts(reactivity_summary.get('status_counts', {}))}")
     lines.append("")
-    lines.append("| 순위 | 코드 | 종목 | 모델군 | 5일등락 | 지수대비 | 최신가 | 당일등락 | 외국인 | 기관 | 반응성 | 판단 | A안 | B안 |")
-    lines.append("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|")
+    lines.append("| 순위 | 코드 | 종목 | 모델군 | 5일등락 | 지수대비 | 최신가 | 당일등락 | 외국인 | 기관 | 반응성 | 판단 |")
+    lines.append("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
     for row in report["stock_strategy"]["candidates"]:
         live = row.get("live_quote") or {}
         momentum = row.get("momentum") or {}
         reactivity = row.get("reactivity") or {}
         models = row.get("model_display") or " / ".join(row.get("model_display_codes") or row.get("model_ids") or row.get("model_groups", []))
-        scenario_map = {item.get("scenario"): item for item in row.get("scenario_decisions", [])}
-        a_decision = scenario_map.get("A", {}).get("decision", "-")
-        b_decision = scenario_map.get("B", {}).get("decision", "-")
         lines.append(
             f"| {reactivity.get('rank', '-')} | {row['ticker']} | {row['name']} | {models} | "
             f"{fmt(momentum.get('return_5d_pct'))}% | {fmt(momentum.get('relative_return_5d_pct'))}%p | "
             f"{fmt(live.get('price'))} | {fmt(live.get('change_pct'))}% | "
             f"{fmt(live.get('foreign_net_억원'))}억 | {fmt(live.get('institution_net_억원'))}억 | "
-            f"{reactivity.get('score', '-')}점/{reactivity.get('status', '-')} | {row['decision']} | "
-            f"{a_decision} | {b_decision} |"
+            f"{reactivity.get('score', '-')}점/{reactivity.get('status', '-')} | {row['decision']} |"
         )
     final_strategy = report.get("final_portfolio_strategy", {})
     if final_strategy:
         lines.append("")
-        lines.append("## 최종 포트폴리오 시나리오")
-        default = final_strategy.get("default_scenario") or {}
-        conditional = final_strategy.get("conditional_scenario") or {}
-        lines.append(f"- 기본안: {default.get('name')} / {default.get('basis')} / 주식 {default.get('stock_weight_range_pct')}%")
-        if conditional:
-            lines.append(f"- 조건부안: {conditional.get('name')} / {conditional.get('basis')} / 주식 {conditional.get('stock_weight_range_pct')}%")
-            lines.append(f"- 전환조건: {' / '.join(final_strategy.get('transition_conditions', []))}")
+        lines.append("## 최종 포트폴리오 비중 정책")
+        lines.append(f"- 주식 비중: {final_strategy.get('stock_weight_range_pct')}%")
+        lines.append(f"- ETF 정책: {final_strategy.get('etf_policy')}")
+        lines.append(f"- 현금/방어 정책: {final_strategy.get('cash_or_defensive_policy')}")
         lines.append(f"- 결론: {final_strategy.get('conclusion')}")
     lines.append("")
     lines.append(f"> {report['disclaimer']}")
