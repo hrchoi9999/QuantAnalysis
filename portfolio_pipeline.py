@@ -212,6 +212,7 @@ def stock_model_summary():
         model_ids = sorted({row["모델"] for row in latest_rows})
         model_display_codes = [MODEL_DISPLAY_MAP.get(model_id, model_id) for model_id in model_ids]
         first_row = latest_rows[0]
+        model_selection_close = to_number(first_row.get("선정일 종가"))
         out.append(
             {
                 "ticker": code,
@@ -219,12 +220,14 @@ def stock_model_summary():
                 "group": meta.get("group") or "weekly_quant_candidate",
                 "decision": meta.get("decision") or "관찰",
                 "latest_selection_date": latest,
+                "model_selection_date": latest,
                 "model_groups": model_groups,
                 "model_ids": model_ids,
                 "model_display_codes": model_display_codes,
                 "model_display": " / ".join(model_display_codes),
                 "model_count": len(model_ids),
-                "selection_close": to_number(first_row.get("선정일 종가")),
+                "selection_close": model_selection_close,
+                "model_selection_close": model_selection_close,
                 "market_cap": to_number(first_row.get("선정일 시가총액")),
                 "return_from_selection_pct": to_number(first_row.get("선정일 대비 종가 등락율(%)")),
                 "holding_days": to_number(first_row.get("보유기간(일)")),
@@ -380,7 +383,7 @@ def load_price_db_quotes(stocks, asof_date):
           AND p.close IS NOT NULL
     """
     out = {}
-    with sqlite3.connect(PRICE_DB_PATH) as con:
+    with sqlite3.connect(price_db_uri(), uri=True) as con:
         for ticker, close, prev_close in con.execute(query, [asof_date, *tickers]):
             change_pct = None
             if prev_close not in (None, 0):
@@ -405,7 +408,7 @@ def load_candidate_markets(stocks):
         WHERE ticker IN ({placeholders})
     """
     try:
-        with sqlite3.connect(PRICE_DB_PATH) as con:
+        with sqlite3.connect(price_db_uri(), uri=True) as con:
             return {ticker: market for ticker, market in con.execute(query, tickers)}
     except sqlite3.Error:
         return {}
@@ -457,7 +460,7 @@ def load_candidate_momentum(stocks, asof_date):
     """
     by_ticker = {ticker: [] for ticker in tickers}
     try:
-        with sqlite3.connect(PRICE_DB_PATH) as con:
+        with sqlite3.connect(price_db_uri(), uri=True) as con:
             for ticker, date, close, volume, value in con.execute(query, [*tickers, asof_date]):
                 if len(by_ticker.setdefault(ticker, [])) < 12:
                     by_ticker[ticker].append(
@@ -809,6 +812,10 @@ def classify_market_rating(total_score, risk_score):
 
 def market_db_uri():
     return f"file:{MARKET_ANALYSIS_DB_PATH.as_posix()}?mode=ro&immutable=1"
+
+
+def price_db_uri():
+    return f"file:///{PRICE_DB_PATH.as_posix()}?mode=ro&immutable=1"
 
 
 def connect_market_db():
@@ -1726,6 +1733,30 @@ def select_top_reactive_candidates(live, limit=10):
     return updated
 
 
+def apply_portfolio_selection_fields(live, asof_date):
+    updated = dict(live)
+    items = []
+    for row in live.get("items", []):
+        item = dict(row)
+        live_quote = item.get("live_quote") or {}
+        momentum = item.get("momentum") or {}
+        portfolio_price = live_quote.get("price")
+        if portfolio_price is None:
+            portfolio_price = momentum.get("latest_close")
+        item["model_selection_date"] = item.get("model_selection_date") or item.get("latest_selection_date")
+        item["model_selection_close"] = item.get("model_selection_close") or item.get("selection_close")
+        item["portfolio_selection_date"] = asof_date
+        item["portfolio_selection_price"] = portfolio_price
+        item["portfolio_selection_price_date"] = live_quote.get("price_date") or momentum.get("price_date") or asof_date
+        item["latest_selection_date"] = asof_date
+        item["selection_close"] = portfolio_price
+        item["return_from_selection_pct"] = 0
+        item["holding_days"] = 0
+        items.append(item)
+    updated["items"] = items
+    return updated
+
+
 def build_candidate_scenario_decisions(row, scenarios):
     live_quote = row.get("live_quote") or {}
     flow_state, net_flow = candidate_flow_state(live_quote)
@@ -2095,6 +2126,7 @@ def build_report(asof_date):
         },
         10,
     )
+    live = apply_portfolio_selection_fields(live, asof_date)
     live = apply_candidate_scenario_decisions(live, portfolio_scenarios)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
@@ -2912,12 +2944,17 @@ def init_portfolio_schema(con):
             candidate_group TEXT,
             decision TEXT,
             latest_selection_date TEXT,
+            model_selection_date TEXT,
+            portfolio_selection_date TEXT,
             model_groups TEXT,
             model_ids TEXT,
             model_display_codes TEXT,
             model_display TEXT,
             model_count INTEGER,
             selection_close REAL,
+            model_selection_close REAL,
+            portfolio_selection_price REAL,
+            portfolio_selection_price_date TEXT,
             market_cap REAL,
             return_from_selection_pct REAL,
             holding_days REAL,
@@ -3026,6 +3063,11 @@ def init_portfolio_schema(con):
     ensure_column(con, "portfolio_stock_candidates", "momentum_json", "TEXT")
     ensure_column(con, "portfolio_stock_candidates", "return_5d_pct", "REAL")
     ensure_column(con, "portfolio_stock_candidates", "relative_return_5d_pct", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "model_selection_date", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "portfolio_selection_date", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "model_selection_close", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "portfolio_selection_price", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "portfolio_selection_price_date", "TEXT")
 
 
 def migrate_portfolio_schema(con):
@@ -3328,14 +3370,16 @@ def save_report_to_db(report, json_path, md_path):
             """
             INSERT INTO portfolio_stock_candidates(
                 run_id, ticker, name, candidate_group, decision, latest_selection_date,
-                model_groups, model_ids, model_display_codes, model_display, model_count, selection_close, market_cap,
+                model_selection_date, portfolio_selection_date,
+                model_groups, model_ids, model_display_codes, model_display, model_count, selection_close,
+                model_selection_close, portfolio_selection_price, portfolio_selection_price_date, market_cap,
                 return_from_selection_pct, holding_days, qualitative_summary, live_price,
                 live_change_pct, foreign_net_억원, institution_net_억원,
                 individual_net_억원, pension_net_억원, scenario_decisions_json,
                 base_decision, reactivity_rank, reactivity_score, reactivity_status,
                 reactivity_json, momentum_json, return_5d_pct, relative_return_5d_pct
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [stock_row(run_id, row) for row in report["stock_strategy"]["candidates"]],
         )
@@ -3448,12 +3492,17 @@ def stock_row(run_id, row):
         row.get("group"),
         row.get("decision"),
         row.get("latest_selection_date"),
+        row.get("model_selection_date"),
+        row.get("portfolio_selection_date"),
         ",".join(row.get("model_groups", [])),
         ",".join(row.get("model_ids", [])),
         ",".join(row.get("model_display_codes", [])),
         row.get("model_display"),
         row.get("model_count"),
         row.get("selection_close"),
+        row.get("model_selection_close"),
+        row.get("portfolio_selection_price"),
+        row.get("portfolio_selection_price_date"),
         row.get("market_cap"),
         row.get("return_from_selection_pct"),
         row.get("holding_days"),
