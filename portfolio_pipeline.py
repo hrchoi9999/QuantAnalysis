@@ -1665,6 +1665,71 @@ def apply_portfolio_selection_fields(live, asof_date):
     return updated
 
 
+def daily_selection_history_path(asof_date):
+    asof_ymd = re.sub(r"[^0-9]", "", asof_date)
+    candidates = []
+    for path in OUTPUT_DIR.glob("daily_portfolio_selection_history_20260513_*.csv"):
+        match = re.search(r"_(\d{8})\.csv$", path.name)
+        if not match:
+            continue
+        ymd = match.group(1)
+        if ymd <= asof_ymd:
+            candidates.append((ymd, path))
+    if not candidates:
+        return None
+    return sorted(candidates)[-1][1]
+
+
+def load_first_portfolio_selection_index(asof_date):
+    path = daily_selection_history_path(asof_date)
+    if not path or not path.exists():
+        return {}
+    first = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows.sort(
+        key=lambda row: (
+            row.get("portfolio_selection_date") or "",
+            int(to_number(row.get("rank")) or 999),
+        )
+    )
+    for row in rows:
+        ticker = row.get("ticker")
+        if ticker and ticker not in first:
+            first[ticker] = row
+    return first
+
+
+def apply_first_final_portfolio_selection_fields(live, asof_date):
+    updated = dict(live)
+    first_by_ticker = load_first_portfolio_selection_index(asof_date)
+    items = []
+    for row in live.get("items", []):
+        item = dict(row)
+        ticker = item.get("ticker")
+        first = first_by_ticker.get(ticker, {})
+        final_date = item.get("portfolio_selection_date") or asof_date
+        final_price = item.get("portfolio_selection_price")
+        if final_price is None:
+            final_price = item.get("selection_close")
+        first_date = first.get("portfolio_selection_date") or final_date
+        first_rank = to_number(first.get("rank"))
+        if first_rank is None:
+            first_rank = (item.get("reactivity") or {}).get("rank")
+        first_price = to_number(first.get("portfolio_selection_close"))
+        if first_price is None:
+            first_price = final_price
+        item["first_portfolio_selection_date"] = first_date
+        item["first_portfolio_selection_rank"] = first_rank
+        item["first_portfolio_selection_price"] = first_price
+        item["final_portfolio_selection_date"] = final_date
+        item["final_portfolio_selection_price"] = final_price
+        item["return_from_first_portfolio_selection_pct"] = pct_return(final_price, first_price)
+        items.append(item)
+    updated["items"] = items
+    return updated
+
+
 def build_candidate_scenario_decisions(row, scenarios):
     return []
 
@@ -1924,6 +1989,7 @@ def build_report(asof_date):
         10,
     )
     live = apply_portfolio_selection_fields(live, asof_date)
+    live = apply_first_final_portfolio_selection_fields(live, asof_date)
     step_details = build_step_details(market_risk, market_context_for_report, s6, e_policy, live)
     previous_context = load_previous_model_explanation_context()
     model_concentration = build_model_concentration_explanation(
@@ -2631,8 +2697,8 @@ def write_markdown(report, path):
         lines.append(f"- 반응성 로직: {reactivity_summary.get('logic_version')}")
         lines.append(f"- 반응성 분포: {format_counts(reactivity_summary.get('status_counts', {}))}")
     lines.append("")
-    lines.append("| 순위 | 코드 | 종목 | 모델군 | 5일등락 | 지수대비 | 최신가 | 당일등락 | 외국인 | 기관 | 반응성 | 판단 |")
-    lines.append("|---:|---|---|---|---:|---:|---:|---:|---:|---:|---|---|")
+    lines.append("| 순위 | 코드 | 종목 | 모델군 | 최초 포트 선정일 | 최초 선정가 | 최종 포트 선정일 | 최종일 주가 | 등락율 | 5일등락 | 지수대비 | 최신가 | 당일등락 | 외국인 | 기관 | 반응성 | 판단 |")
+    lines.append("|---:|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
     for row in report["stock_strategy"]["candidates"]:
         live = row.get("live_quote") or {}
         momentum = row.get("momentum") or {}
@@ -2640,6 +2706,9 @@ def write_markdown(report, path):
         models = row.get("model_display") or " / ".join(row.get("model_display_codes") or row.get("model_ids") or row.get("model_groups", []))
         lines.append(
             f"| {reactivity.get('rank', '-')} | {row['ticker']} | {row['name']} | {models} | "
+            f"{row.get('first_portfolio_selection_date', '-')} | {fmt(row.get('first_portfolio_selection_price'))} | "
+            f"{row.get('final_portfolio_selection_date', '-')} | {fmt(row.get('final_portfolio_selection_price'))} | "
+            f"{fmt(row.get('return_from_first_portfolio_selection_pct'))}% | "
             f"{fmt(momentum.get('return_5d_pct'))}% | {fmt(momentum.get('relative_return_5d_pct'))}%p | "
             f"{fmt(live.get('price'))} | {fmt(live.get('change_pct'))}% | "
             f"{fmt(live.get('foreign_net_억원'))}억 | {fmt(live.get('institution_net_억원'))}억 | "
@@ -2723,6 +2792,12 @@ def init_portfolio_schema(con):
             model_selection_close REAL,
             portfolio_selection_price REAL,
             portfolio_selection_price_date TEXT,
+            first_portfolio_selection_date TEXT,
+            first_portfolio_selection_rank INTEGER,
+            first_portfolio_selection_price REAL,
+            final_portfolio_selection_date TEXT,
+            final_portfolio_selection_price REAL,
+            return_from_first_portfolio_selection_pct REAL,
             market_cap REAL,
             return_from_selection_pct REAL,
             holding_days REAL,
@@ -2836,6 +2911,12 @@ def init_portfolio_schema(con):
     ensure_column(con, "portfolio_stock_candidates", "model_selection_close", "REAL")
     ensure_column(con, "portfolio_stock_candidates", "portfolio_selection_price", "REAL")
     ensure_column(con, "portfolio_stock_candidates", "portfolio_selection_price_date", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "first_portfolio_selection_date", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "first_portfolio_selection_rank", "INTEGER")
+    ensure_column(con, "portfolio_stock_candidates", "first_portfolio_selection_price", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "final_portfolio_selection_date", "TEXT")
+    ensure_column(con, "portfolio_stock_candidates", "final_portfolio_selection_price", "REAL")
+    ensure_column(con, "portfolio_stock_candidates", "return_from_first_portfolio_selection_pct", "REAL")
 
 
 def migrate_portfolio_schema(con):
@@ -3140,14 +3221,17 @@ def save_report_to_db(report, json_path, md_path):
                 run_id, ticker, name, candidate_group, decision, latest_selection_date,
                 model_selection_date, portfolio_selection_date,
                 model_groups, model_ids, model_display_codes, model_display, model_count, selection_close,
-                model_selection_close, portfolio_selection_price, portfolio_selection_price_date, market_cap,
+                model_selection_close, portfolio_selection_price, portfolio_selection_price_date,
+                first_portfolio_selection_date, first_portfolio_selection_rank, first_portfolio_selection_price,
+                final_portfolio_selection_date, final_portfolio_selection_price,
+                return_from_first_portfolio_selection_pct, market_cap,
                 return_from_selection_pct, holding_days, qualitative_summary, live_price,
                 live_change_pct, foreign_net_억원, institution_net_억원,
                 individual_net_억원, pension_net_억원, scenario_decisions_json,
                 base_decision, reactivity_rank, reactivity_score, reactivity_status,
                 reactivity_json, momentum_json, return_5d_pct, relative_return_5d_pct
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [stock_row(run_id, row) for row in report["stock_strategy"]["candidates"]],
         )
@@ -3271,6 +3355,12 @@ def stock_row(run_id, row):
         row.get("model_selection_close"),
         row.get("portfolio_selection_price"),
         row.get("portfolio_selection_price_date"),
+        row.get("first_portfolio_selection_date"),
+        row.get("first_portfolio_selection_rank"),
+        row.get("first_portfolio_selection_price"),
+        row.get("final_portfolio_selection_date"),
+        row.get("final_portfolio_selection_price"),
+        row.get("return_from_first_portfolio_selection_pct"),
         row.get("market_cap"),
         row.get("return_from_selection_pct"),
         row.get("holding_days"),
