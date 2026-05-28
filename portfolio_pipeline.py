@@ -1073,10 +1073,19 @@ def score_data_quality_axis(inputs, asof_date):
 
 
 def step1_grade_from_score(score):
-    for grade, low, high in STEP1_GRADE_BOUNDS:
-        if low <= score <= high:
-            return grade
-    return 6 if score > 100 else 1
+    if score is None:
+        return 1
+    if score < 25:
+        return 1
+    if score < 40:
+        return 2
+    if score < 55:
+        return 3
+    if score < 70:
+        return 4
+    if score < 85:
+        return 5
+    return 6
 
 
 def step1_boundary_info(score, grade):
